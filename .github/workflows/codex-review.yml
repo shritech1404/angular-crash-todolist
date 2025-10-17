@@ -106,7 +106,6 @@ jobs:
           codex exec "Read code_only.diff and follow review_task.txt. $(cat review_task.txt)"
 
       - name: Post review comment to PR
-        if: ${{ steps.diff.outputs.has_code == 'true' && hashFiles('pr-review.md') != '' }}
         uses: actions/github-script@v7
         with:
           script: |
@@ -118,4 +117,5 @@ jobs:
               issue_number: context.payload.pull_request.number,
               body
             });
+
 
