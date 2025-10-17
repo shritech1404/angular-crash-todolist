@@ -1,4 +1,4 @@
-name: Codex PR Review (Azure OpenAI)
+name: Codex PR Review (Azure OpenAI • Code Only)
 
 on:
   pull_request:
@@ -14,9 +14,9 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Set your Azure deployment / model name here (must match your Azure deployment)
+      # Your Azure OpenAI deployment name
       CODEX_MODEL: gpt-4o-mini
-      # Optionally override the API version if you don’t want "preview"
+      # Use a specific API version if desired (defaults to "preview")
       AZURE_OPENAI_API_VERSION: preview
 
     steps:
@@ -34,13 +34,11 @@ jobs:
         run: npm install -g @openai/codex
 
       - name: Write Codex config (Azure OpenAI)
-        # Creates ~/.codex/config.toml using the Azure example from feiskyer/codex-settings
-        # Replace the endpoint & key with your GitHub secrets
         run: |
           mkdir -p ~/.codex
           cat > ~/.codex/config.toml <<'EOF'
           # Codex CLI Configuration (Azure OpenAI)
-          model = "gpt-4o-mini"
+          model = "${{ env.CODEX_MODEL }}"
           model_provider = "azure"
           model_reasoning_summary = "detailed"
           model_verbosity = "medium"
@@ -49,57 +47,95 @@ jobs:
 
           [model_providers.azure]
           name = "Azure"
-          # NOTE: include /openai/v1 suffix; base URL should be your Azure OpenAI endpoint
           base_url = "${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/v1"
           http_headers = { "api-key" = "${{ secrets.AZURE_OPENAI_API_KEY }}" }
           wire_api = "responses"
-          query_params = { api-version = "preview" }
+          query_params = { api-version = "${{ env.AZURE_OPENAI_API_VERSION }}" }
           EOF
 
-      - name: Prepare review prompt
-        id: prompt
+      - name: Gather changed CODE files (exclude docs/assets/lockfiles/generated)
+        id: files
+        shell: bash
+        env:
+          BASE: ${{ github.base_ref }}
         run: |
+          # Ensure we have the base branch for accurate diffs
+          git fetch origin "${BASE}:${BASE}" || git fetch origin "${BASE}"
+          # List changed files between base and HEAD
+          CHANGED=$(git diff --name-only "origin/${BASE}...HEAD")
+
+          # Keep only code files; drop docs, media, lockfiles, generated, vendored, etc.
+          CODE_ONLY=$(echo "$CHANGED" | \
+            grep -E '\.(c|cc|cpp|cxx|h|hpp|hh|m|mm|cs|go|java|kt|kts|ts|tsx|js|jsx|py|rb|rs|php|swift|scala|lua|pl|erl|ex|exs|r|sql|sh|bash|ps1|Dockerfile|make|mk)$' || true)
+
+          # Exclude common non-review targets/paths and generated artifacts
+          CODE_ONLY=$(echo "$CODE_ONLY" | \
+            grep -Ev '(^|/)(docs?|documentation|examples|example|specs?|spec|designs?)($|/)' | \
+            grep -Ev '(^|/)(dist|build|out|coverage|vendor|node_modules|.git|.husky|.vscode|.idea)($|/)' | \
+            grep -Ev '\.(md|rst|txt|png|jpg|jpeg|gif|svg|ico|pdf|zip|tar|tgz|gz|7z|rar|lock|map|min\.js|snap)$' || true)
+
+          # Write a newline-separated list for later steps
+          echo "$CODE_ONLY" > changed_code_files.txt
+
+          # Produce a focused unified diff for those files (no context makes it tighter for LLMs)
+          if [ -s changed_code_files.txt ]; then
+            git --no-pager diff --unified=0 "origin/${BASE}...HEAD" -- $(tr '\n' ' ' < changed_code_files.txt) > code_only.diff || true
+          else
+            : > code_only.diff
+          fi
+
+          echo "changed_count=$(wc -l < changed_code_files.txt | tr -d ' ')" >> $GITHUB_OUTPUT
+
+      - name: Short-circuit if there are no code changes
+        if: ${{ steps.files.outputs.changed_count == '0' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: ":white_check_mark: No code changes detected to review (docs/assets/lockfiles were excluded)."
+            });
+
+      - name: Prepare code-only review task
+        if: ${{ steps.files.outputs.changed_count != '0' }}
+        run: |
+          # Minimal, code-focused instructions that mimic "@codex review"
           cat > review_task.txt << 'PROMPT'
-          You are running inside a CI environment for a GitHub pull request.
+          You are Codex running in CI on a GitHub Pull Request.
 
-          Task: Perform a thorough PR review and produce a SINGLE Markdown report saved to pr-review.md that includes:
-          1) A high-level summary of changes.
-          2) Architectural/logic issues and risks.
-          3) Bug risks and edge cases.
-          4) Security and secrets hygiene notes.
-          5) Performance/complexity concerns.
-          6) Style/consistency findings aligned with common conventions in this repo.
-          7) Concrete, line-anchored suggestions (code blocks) where helpful.
-          8) A quick checklist of must-fix vs nice-to-have items.
+          Only review CODE changes. Ignore:
+          - Markdown/docs, images/media, lockfiles, vendored/build outputs, and generated artifacts.
+          - Anything not present in 'code_only.diff'.
 
-          Context:
-          - Repo is checked out at $GITHUB_WORKSPACE
-          - Base branch: $GITHUB_BASE_REF
-          - Head branch: $GITHUB_HEAD_REF
-          - PR number: $PR_NUMBER
+          Inputs available in the workspace:
+          - changed_code_files.txt : list of changed code files
+          - code_only.diff         : unified=0 diff for the changed code files
 
-          Steps you may take (feel free to adjust):
-          - Inspect changed files: `git diff --name-only origin/$GITHUB_BASE_REF...HEAD`
-          - Generate diffs: `git --no-pager diff origin/$GITHUB_BASE_REF...HEAD -- <file>`
-          - Read files for deeper analysis.
-          - Do NOT push commits; only analyze and write pr-review.md to the workspace.
+          Task:
+          - Analyze code_only.diff (and open files as needed) to provide a concise, actionable PR review.
+          - Focus on correctness, logic, API contracts, edge cases, security, performance, and style consistency for THIS repo.
+          - Suggest concrete code edits with small diff/code blocks where helpful.
 
           Output:
-          - Write the final review to pr-review.md in Markdown, suitable for posting as a PR comment.
+          - Write a single Markdown review to pr-review.md, suitable for posting as a PR comment.
+          - Keep signal high; avoid restating the diff. Prioritize must-fix items first.
+
           PROMPT
 
-      - name: Run Codex to generate PR review
-        # Use codex exec so it’s non-interactive in CI
+      - name: Run Codex review (code-only)
+        if: ${{ steps.files.outputs.changed_count != '0' }}
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GITHUB_BASE_REF: ${{ github.base_ref }}
           GITHUB_HEAD_REF: ${{ github.head_ref }}
         run: |
-          # Give Codex the instruction and let it read the repo / run git commands
-          codex exec "$(cat review_task.txt)"
+          # Nudge Codex with the exact artifacts we created
+          codex exec "Read code_only.diff and changed_code_files.txt, then follow review_task.txt. $(cat review_task.txt)"
 
       - name: Post review comment to PR
-        if: ${{ hashFiles('pr-review.md') != '' }}
+        if: ${{ steps.files.outputs.changed_count != '0' && hashFiles('pr-review.md') != '' }}
         uses: actions/github-script@v7
         with:
           script: |
@@ -111,4 +147,3 @@ jobs:
               issue_number: context.payload.pull_request.number,
               body
             });
-
