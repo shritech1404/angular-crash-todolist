@@ -34,6 +34,8 @@ jobs:
           model = "${{ env.CODEX_MODEL }}"
           model_provider = "azure"
           approval_policy = "on-request"
+          model_reasoning_summary = "detailed"
+          model_reasoning_effort = "high"
 
           [model_providers.azure]
           name = "Azure"
@@ -52,15 +54,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          CHANGED=$(git diff --name-only "$BASE...$HEAD")
+          # List changed files
+          CHANGED=$(git diff --name-only "$BASE...$HEAD" || true)
 
+          # Allow-list common code extensions
           CODE=$(echo "$CHANGED" | \
             grep -E '\.(c|cc|cpp|cxx|h|hpp|m|mm|cs|go|java|kt|kts|ts|tsx|js|jsx|py|rb|rs|php|swift|scala|lua|pl|ex|exs|sql|sh|bash|ps1|dart|vue|svelte|cmake|mk|Makefile|gradle|groovy|zig)$' || true)
 
+          # Exclude workflows/config/docs/assets/vendor/build outputs
           CODE=$(echo "$CODE" | \
             grep -Ev '(^|/)\.github/|(^|/)node_modules/|(^|/)(dist|build|out|coverage|vendor)($|/)' | \
-            grep -Ev '\.(ya?ml|toml|ini|conf|json|lock|md|rst|txt|png|jpe?g|gif|svg|pdf)$' || true)
+            grep -Ev '\.(ya?ml|toml|ini|conf|json|lock|md|rst|txt|png|jpe?g|gif|svg|pdf|map|min\.js)$' || true)
 
+          # Save file list (may be empty)
           printf "%s\n" $CODE > changed_code_files.txt || true
 
           if [ ! -s changed_code_files.txt ]; then
@@ -69,7 +75,9 @@ jobs:
             exit 0
           fi
 
+          # Tight diff for ONLY those files
           git --no-pager diff --unified=0 "$BASE...$HEAD" -- $(tr '\n' ' ' < changed_code_files.txt) > code_only.diff || true
+
           if [ -s code_only.diff ]; then
             echo "has_code=true" >> $GITHUB_OUTPUT
           else
@@ -91,13 +99,12 @@ jobs:
         if: ${{ steps.diff.outputs.has_code == 'true' }}
         shell: bash
         run: |
-          set -e
-          REVIEW="$(codex exec "Read code_only.diff and follow review_task.txt. $(cat review_task.txt)")"
-          # Fallback if Codex returns nothing
+          set -euo pipefail
+          REVIEW="$(codex exec "Read code_only.diff and follow review_task.txt. $(cat review_task.txt)")" || true
           if [ -z "$REVIEW" ]; then
             REVIEW=":warning: Codex ran but produced no review output. Check CI logs."
           fi
-          # (Optional) truncate to avoid output-size limits
+          # Optional truncation to avoid any size limits
           MAX=120000
           if [ ${#REVIEW} -gt $MAX ]; then
             REVIEW="${REVIEW:0:$MAX}\n\n… _(truncated)_"
@@ -115,7 +122,7 @@ jobs:
           REVIEW_BODY_JSON: ${{ toJson(steps.codex_review.outputs.body) }}
         with:
           script: |
-            // Read safely from env and parse JSON so special chars/backticks can't break JS parsing
+            // Safely parse multi-line body from env (avoids JS parsing issues)
             const body = JSON.parse(process.env.REVIEW_BODY_JSON || '""').trim() || ":warning: Codex output was empty.";
             await github.rest.issues.createComment({
               owner: context.repo.owner,
@@ -123,7 +130,6 @@ jobs:
               issue_number: context.payload.pull_request.number,
               body
             });
-
 
       - name: Skip – no code changes
         if: ${{ steps.diff.outputs.has_code != 'true' }}
@@ -136,4 +142,3 @@ jobs:
               issue_number: context.payload.pull_request.number,
               body: ":white_check_mark: No *code* changes to review (configs/docs/assets excluded)."
             });
-
