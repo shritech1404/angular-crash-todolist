@@ -14,9 +14,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Your Azure OpenAI deployment name
       CODEX_MODEL: gpt-4o-mini
-      # Use a specific API version if desired (defaults to "preview")
       AZURE_OPENAI_API_VERSION: preview
 
     steps:
@@ -37,7 +35,6 @@ jobs:
         run: |
           mkdir -p ~/.codex
           cat > ~/.codex/config.toml <<'EOF'
-          # Codex CLI Configuration (Azure OpenAI)
           model = "${{ env.CODEX_MODEL }}"
           model_provider = "azure"
           model_reasoning_summary = "detailed"
@@ -53,41 +50,57 @@ jobs:
           query_params = { api-version = "${{ env.AZURE_OPENAI_API_VERSION }}" }
           EOF
 
-      - name: Gather changed CODE files (exclude docs/assets/lockfiles/generated)
-        id: files
+      - name: Build code-only diff
+        id: codeonly
         shell: bash
         env:
-          BASE: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          # Ensure we have the base branch for accurate diffs
-          git fetch origin "${BASE}:${BASE}" || git fetch origin "${BASE}"
-          # List changed files between base and HEAD
-          CHANGED=$(git diff --name-only "origin/${BASE}...HEAD")
+          set -euo pipefail
 
-          # Keep only code files; drop docs, media, lockfiles, generated, vendored, etc.
+          # List changed files between base and head SHAs
+          CHANGED=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+
+          # Allow-list common code extensions (no configs / content)
+          # and HARD-EXCLUDE workflow/config & vendor/build paths.
           CODE_ONLY=$(echo "$CHANGED" | \
-            grep -E '\.(c|cc|cpp|cxx|h|hpp|hh|m|mm|cs|go|java|kt|kts|ts|tsx|js|jsx|py|rb|rs|php|swift|scala|lua|pl|erl|ex|exs|r|sql|sh|bash|ps1|Dockerfile|make|mk)$' || true)
+            grep -E '\.(c|cc|cpp|cxx|h|hpp|hh|m|mm|cs|go|java|kt|kts|ts|tsx|js|jsx|py|rb|rs|php|swift|scala|lua|pl|erl|ex|exs|r|sql|sh|bash|ps1|dart|vue|svelte|zig|cmake|mk|make|gradle|groovy)$' || true)
 
-          # Exclude common non-review targets/paths and generated artifacts
+          # Exclude non-code & infra/config:
+          # - Workflows / GitHub config
+          # - Generic configs & metadata
+          # - Vendor/build artifacts
           CODE_ONLY=$(echo "$CODE_ONLY" | \
-            grep -Ev '(^|/)(docs?|documentation|examples|example|specs?|spec|designs?)($|/)' | \
-            grep -Ev '(^|/)(dist|build|out|coverage|vendor|node_modules|.git|.husky|.vscode|.idea)($|/)' | \
-            grep -Ev '\.(md|rst|txt|png|jpg|jpeg|gif|svg|ico|pdf|zip|tar|tgz|gz|7z|rar|lock|map|min\.js|snap)$' || true)
+            grep -Ev '(^|/)\.github/|(^|/)azure-pipelines\.y[a]ml$|(^|/)Jenkinsfile$' | \
+            grep -Ev '\.(ya?ml|toml|ini|conf|json|lock|md|rst|txt|yml)$' | \
+            grep -Ev '(^|/)(dist|build|out|coverage|vendor|node_modules|\.git|\.husky|\.vscode|\.idea)($|/)' || true)
 
-          # Write a newline-separated list for later steps
-          echo "$CODE_ONLY" > changed_code_files.txt
+          # Also exclude any leftover workflow files explicitly
+          CODE_ONLY=$(echo "$CODE_ONLY" | grep -Ev '(^|/)\.github/workflows/.*\.ya?ml$' || true)
 
-          # Produce a focused unified diff for those files (no context makes it tighter for LLMs)
-          if [ -s changed_code_files.txt ]; then
-            git --no-pager diff --unified=0 "origin/${BASE}...HEAD" -- $(tr '\n' ' ' < changed_code_files.txt) > code_only.diff || true
-          else
+          # Save the list for Codex
+          printf "%s\n" $CODE_ONLY > changed_code_files.txt || true
+
+          # If no code files remain, create an empty diff and flag 0
+          if [ ! -s changed_code_files.txt ]; then
             : > code_only.diff
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          echo "changed_count=$(wc -l < changed_code_files.txt | tr -d ' ')" >> $GITHUB_OUTPUT
+          # Create a tight unified=0 diff for ONLY those files
+          git --no-pager diff --unified=0 "$BASE_SHA...$HEAD_SHA" -- $(tr '\n' ' ' < changed_code_files.txt) > code_only.diff || true
 
-      - name: Short-circuit if there are no code changes
-        if: ${{ steps.files.outputs.changed_count == '0' }}
+          # If diff ended up empty (all deletions/renames filtered), mark 0
+          if [ ! -s code_only.diff ]; then
+            echo "count=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "count=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: No code changes — post skip comment
+        if: ${{ steps.codeonly.outputs.count == '0' }}
         uses: actions/github-script@v7
         with:
           script: |
@@ -95,47 +108,40 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.pull_request.number,
-              body: ":white_check_mark: No code changes detected to review (docs/assets/lockfiles were excluded)."
+              body: ":white_check_mark: Skipping Codex — no *code* changes to review (workflows/config/docs/assets were excluded)."
             });
 
       - name: Prepare code-only review task
-        if: ${{ steps.files.outputs.changed_count != '0' }}
+        if: ${{ steps.codeonly.outputs.count == '1' }}
         run: |
-          # Minimal, code-focused instructions that mimic "@codex review"
           cat > review_task.txt << 'PROMPT'
           You are Codex running in CI on a GitHub Pull Request.
 
-          Only review CODE changes. Ignore:
-          - Markdown/docs, images/media, lockfiles, vendored/build outputs, and generated artifacts.
-          - Anything not present in 'code_only.diff'.
+          Only review CODE changes from code_only.diff.
+          Ignore workflows (.github/workflows/**), YAML/TOML/JSON configs, lockfiles, docs, media, generated and vendor/build outputs.
 
-          Inputs available in the workspace:
-          - changed_code_files.txt : list of changed code files
-          - code_only.diff         : unified=0 diff for the changed code files
+          Inputs:
+            - changed_code_files.txt : newline list of code files that changed
+            - code_only.diff         : unified=0 diff for those files
 
           Task:
-          - Analyze code_only.diff (and open files as needed) to provide a concise, actionable PR review.
-          - Focus on correctness, logic, API contracts, edge cases, security, performance, and style consistency for THIS repo.
-          - Suggest concrete code edits with small diff/code blocks where helpful.
+            - Analyze code_only.diff (open files as needed) for correctness, logic, API contracts, edge cases, security, performance, and repo style.
+            - Provide concrete suggestions with small code blocks / patch hunks where helpful.
+            - Be concise and actionable; prioritize must-fix items first.
 
           Output:
-          - Write a single Markdown review to pr-review.md, suitable for posting as a PR comment.
-          - Keep signal high; avoid restating the diff. Prioritize must-fix items first.
-
+            - Write a single Markdown review to pr-review.md for posting as a PR comment.
           PROMPT
 
       - name: Run Codex review (code-only)
-        if: ${{ steps.files.outputs.changed_count != '0' }}
+        if: ${{ steps.codeonly.outputs.count == '1' }}
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          GITHUB_BASE_REF: ${{ github.base_ref }}
-          GITHUB_HEAD_REF: ${{ github.head_ref }}
         run: |
-          # Nudge Codex with the exact artifacts we created
           codex exec "Read code_only.diff and changed_code_files.txt, then follow review_task.txt. $(cat review_task.txt)"
 
       - name: Post review comment to PR
-        if: ${{ steps.files.outputs.changed_count != '0' && hashFiles('pr-review.md') != '' }}
+        if: ${{ steps.codeonly.outputs.count == '1' && hashFiles('pr-review.md') != '' }}
         uses: actions/github-script@v7
         with:
           script: |
