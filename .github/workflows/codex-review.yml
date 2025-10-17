@@ -1,0 +1,146 @@
+name: Azure Codex Auto Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write        # to allow pushes / updates to files
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          # by default, it uses GITHUB_TOKEN to persist credentials
+
+      - name: Run Azure OpenAI review & comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            // Get diff
+            const { data: diff } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              mediaType: { format: 'diff' }
+            });
+            // Build prompt
+            const prompt = `
+You are a code reviewer. Here is the diff from PR #${pr.number}:
+\`\`\`
+${diff}
+\`\`\`
+Please give feedback on correctness, performance, security, docs, style.
+`;
+            // Call Azure OpenAI
+            const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
+            const apiKey = process.env.AZURE_OPENAI_KEY;
+            const deployment = process.env.AZURE_OPENAI_DEPLOYMENT;
+            const response = await fetch(
+              `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=2023-05-15`,
+              {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'api-key': apiKey
+                },
+                body: JSON.stringify({
+                  messages: [
+                    { role: 'system', content: 'You are an expert code reviewer.' },
+                    { role: 'user', content: prompt }
+                  ],
+                  max_tokens: 1000,
+                  temperature: 0.0
+                })
+              }
+            );
+            if (!response.ok) {
+              throw new Error(`OpenAI responded with ${response.status}`);
+            }
+            const respJson = await response.json();
+            const reviewOutput = respJson.choices[0].message.content;
+            // Post comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body: `**Codex Review (Azure OpenAI)**\n\n${reviewOutput}`
+            });
+
+  # Optional job to update docs
+  update-docs:
+    runs-on: ubuntu-latest
+    needs: review
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Generate doc edits via Azure OpenAI
+        id: gen_docs
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            const { data: diff } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              mediaType: { format: 'diff' }
+            });
+            const prompt = `
+Based on changes in this PR, suggest edits to README, docs, or comments. Output in patch / diff format.
+Diff:
+\`\`\`
+${diff}
+\`\`\`
+`;
+            const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
+            const apiKey = process.env.AZURE_OPENAI_KEY;
+            const deployment = process.env.AZURE_OPENAI_DEPLOYMENT;
+            const resp = await fetch(
+              `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=2023-05-15`,
+              {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'api-key': apiKey
+                },
+                body: JSON.stringify({
+                  messages: [
+                    { role: 'system', content: 'You are a documentation assistant.' },
+                    { role: 'user', content: prompt }
+                  ],
+                  max_tokens: 800,
+                  temperature: 0.0
+                })
+              }
+            );
+            if (!resp.ok) {
+              throw new Error(`OpenAI responded with ${resp.status}`);
+            }
+            const j = await resp.json();
+            return j.choices[0].message.content;
+
+      - name: Apply and commit doc patch if any
+        run: |
+          echo "${{ steps.gen_docs.outputs.result }}" > docs_patch.diff
+          if [ -s docs_patch.diff ]; then
+            git apply docs_patch.diff
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -am "docs: update based on PR changes"
+            git push origin HEAD:${{ github.head_ref }}
+          else
+            echo "No documentation changes proposed."
+          fi
