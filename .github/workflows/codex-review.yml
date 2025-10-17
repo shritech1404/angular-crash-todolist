@@ -13,12 +13,27 @@ jobs:
         with:
           fetch-depth: 0
       
+      # Try multiple config locations
+      - name: Disable web search tool
+        run: |
+          mkdir -p ~/.config/codex
+          mkdir -p ~/.codex
+          cat <<EOF > ~/.config/codex/config.toml
+          [tools]
+          web_search = false
+          EOF
+          cat <<EOF > ~/.codex/config.toml
+          [tools]
+          web_search = false
+          EOF
+      
       - name: Run Codex Review with Azure OpenAI
         uses: gersmann/codex-review-action@v1
         env:
           OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/v1
           CODEX_DISABLE_WEB_SEARCH: "true"
+          CODEX_WEB_SEARCH: "false"
         with:
           mode: review
           openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
