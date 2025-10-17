@@ -1,4 +1,4 @@
-name: Codex Autonomous Code Review
+name: Codex Autonomous Code Review (Azure gpt-4o-mini)
 
 on:
   pull_request:
@@ -25,18 +25,28 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # Disable hosted web_search tool (Azure doesn't support it)
+      - name: Configure Codex (disable web search)
+        run: |
+          mkdir -p ~/.codex
+          cat > ~/.codex/config.toml <<'EOF'
+          [tools]
+          web_search = false
+          EOF
+
       - name: Codex autonomous review (Azure OpenAI)
         uses: gersmann/codex-review-action@v1
         env:
-          # Point OpenAI SDK at Azure
+          # Azure OpenAI endpoint configuration
           OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/v1
+          # Uncomment this if your resource requires explicit versioning
+          # OPENAI_API_VERSION: "2025-03-01-preview"
         with:
           mode: review
-          # The action still expects an "openai_api_key" input; pass the Azure key
           openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          # Use your Azure **deployment name** (not the base model name)
-          model: ${{ secrets.AZURE_OPENAI_MODEL }}
+          model: gpt-4o-mini         # ✅ Azure deployment name or 'gpt-4o-mini' if same
           reasoning_effort: medium
           debug_level: 1
 
@@ -50,13 +60,23 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Configure Codex (disable web search)
+        run: |
+          mkdir -p ~/.codex
+          cat > ~/.codex/config.toml <<'EOF'
+          [tools]
+          web_search = false
+          EOF
+
       - name: Codex autonomous edits (Azure OpenAI)
         uses: gersmann/codex-review-action@v1
         env:
           OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/v1
+          # OPENAI_API_VERSION: "2025-03-01-preview"
         with:
           mode: act
           openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          model: ${{ secrets.AZURE_OPENAI_MODEL }}
+          model: gpt-4o-mini
           debug_level: 1
