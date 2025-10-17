@@ -1,13 +1,10 @@
 name: Codex Review (Azure OpenAI)
-
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-
 permissions:
   contents: write
   pull-requests: write
-
 jobs:
   review:
     runs-on: ubuntu-latest
@@ -15,27 +12,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      # Disable web search via config
-      - name: Disable web search tool
-        run: |
-          mkdir -p ~/.codex
-          cat <<EOF > ~/.codex/config.toml
-          [tools]
-          web_search = false
-          EOF
-
+      
       - name: Run Codex Review with Azure OpenAI
         uses: gersmann/codex-review-action@v1
         env:
           OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/v1
-          # OPENAI_API_VERSION: "2025-03-01-preview"   # optional if needed
+          CODEX_DISABLE_WEB_SEARCH: "true"
         with:
           mode: review
           openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
           model: gpt-4o-mini
           reasoning_effort: medium
           debug_level: 1
-          # Optional override if action supports it:
-          # additional_config: '{"tools": {"web_search": false}}'
