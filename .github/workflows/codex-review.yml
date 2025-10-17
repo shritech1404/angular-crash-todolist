@@ -34,8 +34,9 @@ jobs:
           model = "${{ env.CODEX_MODEL }}"
           model_provider = "azure"
           approval_policy = "on-request"
-
+      
           [model_providers.azure]
+          name = "Azure"
           base_url = "${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/v1"
           http_headers = { "api-key" = "${{ secrets.AZURE_OPENAI_API_KEY }}" }
           wire_api = "responses"
@@ -117,3 +118,4 @@ jobs:
               issue_number: context.payload.pull_request.number,
               body
             });
+
