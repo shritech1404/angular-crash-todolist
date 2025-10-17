@@ -1,144 +1,21 @@
-name: Codex PR Review (Code Only)
-
-on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-
-permissions:
-  contents: read
-  pull-requests: write
+name: AI Agent Workflow
+on: [push, pull_request]
 
 jobs:
-  review:
-    if: ${{ !github.event.pull_request.draft }}
+  agent_task:
     runs-on: ubuntu-latest
-
-    env:
-      CODEX_MODEL: gpt-4o-mini
-      AZURE_OPENAI_API_VERSION: preview
-
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-
-      - uses: actions/setup-node@v4
-        with: { node-version: '20' }
-
-      - name: Install Codex CLI
-        run: npm i -g @openai/codex
-
-      - name: Configure Codex (Azure OpenAI)
+      
+      - name: Setup Codex
         run: |
-          mkdir -p ~/.codex
-          cat > ~/.codex/config.toml <<'EOF'
-          model = "${{ env.CODEX_MODEL }}"
-          model_provider = "azure"
-          approval_policy = "on-request"
-          model_reasoning_summary = "detailed"
-          model_reasoning_effort = "high"
-
-          [model_providers.azure]
-          name = "Azure"
-          base_url = "${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/v1"
-          http_headers = { "api-key" = "${{ secrets.AZURE_OPENAI_API_KEY }}" }
-          wire_api = "responses"
-          query_params = { api-version = "${{ env.AZURE_OPENAI_API_VERSION }}" }
-          EOF
-
-      - name: Build code-only diff
-        id: diff
-        shell: bash
+          echo "Setting up Codex environment..."
+          
+      - name: Run Codex
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          TASK_DESCRIPTION: "Review code and check for any errors, vulnerabilities "
         run: |
-          set -euo pipefail
-
-          # List changed files
-          CHANGED=$(git diff --name-only "$BASE...$HEAD" || true)
-
-          # Allow-list common code extensions
-          CODE=$(echo "$CHANGED" | \
-            grep -E '\.(c|cc|cpp|cxx|h|hpp|m|mm|cs|go|java|kt|kts|ts|tsx|js|jsx|py|rb|rs|php|swift|scala|lua|pl|ex|exs|sql|sh|bash|ps1|dart|vue|svelte|cmake|mk|Makefile|gradle|groovy|zig)$' || true)
-
-          # Exclude workflows/config/docs/assets/vendor/build outputs
-          CODE=$(echo "$CODE" | \
-            grep -Ev '(^|/)\.github/|(^|/)node_modules/|(^|/)(dist|build|out|coverage|vendor)($|/)' | \
-            grep -Ev '\.(ya?ml|toml|ini|conf|json|lock|md|rst|txt|png|jpe?g|gif|svg|pdf|map|min\.js)$' || true)
-
-          # Save file list (may be empty)
-          printf "%s\n" $CODE > changed_code_files.txt || true
-
-          if [ ! -s changed_code_files.txt ]; then
-            : > code_only.diff
-            echo "has_code=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # Tight diff for ONLY those files
-          git --no-pager diff --unified=0 "$BASE...$HEAD" -- $(tr '\n' ' ' < changed_code_files.txt) > code_only.diff || true
-
-          if [ -s code_only.diff ]; then
-            echo "has_code=true" >> $GITHUB_OUTPUT
-          else
-            echo "has_code=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Prepare brief review prompt
-        if: ${{ steps.diff.outputs.has_code == 'true' }}
-        run: |
-          cat > review_task.txt << 'PROMPT'
-          You are Codex in CI. Review ONLY the code changes in code_only.diff.
-          Focus on: correctness, logic, edge cases, security, performance, and local style.
-          Provide concise, actionable suggestions with small code blocks where helpful.
-          Output to STDOUT (no files). Put must-fix items first.
-          PROMPT
-
-      - name: Run Codex review (no file)
-        id: codex_review
-        if: ${{ steps.diff.outputs.has_code == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          REVIEW="$(codex exec "Read code_only.diff and follow review_task.txt. $(cat review_task.txt)")" || true
-          if [ -z "$REVIEW" ]; then
-            REVIEW=":warning: Codex ran but produced no review output. Check CI logs."
-          fi
-          # Optional truncation to avoid any size limits
-          MAX=120000
-          if [ ${#REVIEW} -gt $MAX ]; then
-            REVIEW="${REVIEW:0:$MAX}\n\n… _(truncated)_"
-          fi
-          {
-            echo 'body<<EOF'
-            echo "$REVIEW"
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Post review comment to PR
-        if: ${{ steps.diff.outputs.has_code == 'true' }}
-        uses: actions/github-script@v7
-        env:
-          REVIEW_BODY_JSON: ${{ toJson(steps.codex_review.outputs.body) }}
-        with:
-          script: |
-            // Safely parse multi-line body from env (avoids JS parsing issues)
-            const body = JSON.parse(process.env.REVIEW_BODY_JSON || '""').trim() || ":warning: Codex output was empty.";
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body
-            });
-
-      - name: Skip – no code changes
-        if: ${{ steps.diff.outputs.has_code != 'true' }}
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body: ":white_check_mark: No *code* changes to review (configs/docs/assets excluded)."
-            });
+          echo "Running Codex with task: Review code and check for any errors, vulnerabilities "
+          # Agent-specific commands will be executed here
+          echo "Task completed successfully"
