@@ -1,82 +1,39 @@
-name: Codex Autonomous Code Review (Azure gpt-4o-mini)
+name: Codex Review (Azure OpenAI)
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-  issue_comment:
-    types: [created]
-  pull_request_review_comment:
-    types: [created]
 
 permissions:
   contents: write
   pull-requests: write
 
-concurrency:
-  group: codex-review-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
-  cancel-in-progress: true
-
 jobs:
   review:
-    name: Review
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # Disable hosted web_search tool (Azure doesn't support it)
-      - name: Configure Codex (disable web search)
+      # Optional: disable hosted tools that Azure doesn’t support
+      - name: Disable web search tool
         run: |
           mkdir -p ~/.codex
-          cat > ~/.codex/config.toml <<'EOF'
-          [tools]
-          web_search = false
-          EOF
+          echo "[tools]" > ~/.codex/config.toml
+          echo "web_search = false" >> ~/.codex/config.toml
 
-      - name: Codex autonomous review (Azure OpenAI)
+      - name: Run Codex Review with Azure OpenAI
         uses: gersmann/codex-review-action@v1
         env:
-          # Azure OpenAI endpoint configuration
           OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/v1
-          # Uncomment this if your resource requires explicit versioning
+          # Uncomment the next line if your Azure setup needs an explicit API version:
           # OPENAI_API_VERSION: "2025-03-01-preview"
         with:
           mode: review
           openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          model: gpt-4o-mini         # ✅ Azure deployment name or 'gpt-4o-mini' if same
+          model: gpt-4o-mini   # your Azure deployment name
           reasoning_effort: medium
-          debug_level: 1
-
-  act:
-    name: Act on /codex comments
-    if: >-
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '/codex')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '/codex'))
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Configure Codex (disable web search)
-        run: |
-          mkdir -p ~/.codex
-          cat > ~/.codex/config.toml <<'EOF'
-          [tools]
-          web_search = false
-          EOF
-
-      - name: Codex autonomous edits (Azure OpenAI)
-        uses: gersmann/codex-review-action@v1
-        env:
-          OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/v1
-          # OPENAI_API_VERSION: "2025-03-01-preview"
-        with:
-          mode: act
-          openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          model: gpt-4o-mini
           debug_level: 1
