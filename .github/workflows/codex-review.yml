@@ -34,6 +34,7 @@ jobs:
         with:
           mode: review
           openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          model: gpt-4o-mini   # your Azure deployment name
+          model: gpt-5o-mini   # your Azure deployment name
           reasoning_effort: medium
           debug_level: 1
+
