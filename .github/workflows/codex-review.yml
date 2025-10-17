@@ -9,7 +9,7 @@ on:
     types: [created]
 
 permissions:
-  contents: write           # needed for act mode pushes; safe for review mode
+  contents: write
   pull-requests: write
 
 concurrency:
@@ -25,12 +25,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Codex autonomous review
+      - name: Codex autonomous review (Azure OpenAI)
         uses: gersmann/codex-review-action@v1
+        env:
+          # Point OpenAI SDK at Azure
+          OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/v1
         with:
           mode: review
-          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
-          model: gpt-5
+          # The action still expects an "openai_api_key" input; pass the Azure key
+          openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          # Use your Azure **deployment name** (not the base model name)
+          model: ${{ secrets.AZURE_OPENAI_MODEL }}
           reasoning_effort: medium
           debug_level: 1
 
@@ -44,10 +50,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Codex autonomous edits
+      - name: Codex autonomous edits (Azure OpenAI)
         uses: gersmann/codex-review-action@v1
+        env:
+          OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/v1
         with:
           mode: act
-          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
-          model: gpt-5
+          openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          model: ${{ secrets.AZURE_OPENAI_MODEL }}
           debug_level: 1
