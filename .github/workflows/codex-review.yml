@@ -43,10 +43,11 @@ jobs:
         uses: gersmann/codex-review-action@v1
         env:
           OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/deployments/gpt-4o-mini
+          OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
           OPENAI_API_VERSION: "2024-08-01-preview"
         with:
           mode: review
           openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
           model: gpt-4o-mini
           debug_level: 1
+
