@@ -24,8 +24,8 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
 
-      - run: npm i -g @openai/codex
-        name: Install Codex CLI
+      - name: Install Codex CLI
+        run: npm i -g @openai/codex
 
       - name: Configure Codex (Azure OpenAI)
         run: |
@@ -34,7 +34,7 @@ jobs:
           model = "${{ env.CODEX_MODEL }}"
           model_provider = "azure"
           approval_policy = "on-request"
-      
+
           [model_providers.azure]
           name = "Azure"
           base_url = "${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/v1"
@@ -52,10 +52,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # List changed files
           CHANGED=$(git diff --name-only "$BASE...$HEAD")
 
-          # Allow-list common code extensions; exclude workflows/config/docs/assets.
           CODE=$(echo "$CHANGED" | \
             grep -E '\.(c|cc|cpp|cxx|h|hpp|m|mm|cs|go|java|kt|kts|ts|tsx|js|jsx|py|rb|rs|php|swift|scala|lua|pl|ex|exs|sql|sh|bash|ps1|dart|vue|svelte|cmake|mk|Makefile|gradle|groovy|zig)$' || true)
 
@@ -78,6 +76,51 @@ jobs:
             echo "has_code=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Prepare brief review prompt
+        if: ${{ steps.diff.outputs.has_code == 'true' }}
+        run: |
+          cat > review_task.txt << 'PROMPT'
+          You are Codex in CI. Review ONLY the code changes in code_only.diff.
+          Focus on: correctness, logic, edge cases, security, performance, and local style.
+          Provide concise, actionable suggestions with small code blocks where helpful.
+          Output to STDOUT (no files). Put must-fix items first.
+          PROMPT
+
+      - name: Run Codex review (no file)
+        id: codex_review
+        if: ${{ steps.diff.outputs.has_code == 'true' }}
+        shell: bash
+        run: |
+          set -e
+          REVIEW="$(codex exec "Read code_only.diff and follow review_task.txt. $(cat review_task.txt)")"
+          # Fallback if Codex returns nothing
+          if [ -z "$REVIEW" ]; then
+            REVIEW=":warning: Codex ran but produced no review output. Check CI logs."
+          fi
+          # (Optional) truncate to avoid output-size limits
+          MAX=120000
+          if [ ${#REVIEW} -gt $MAX ]; then
+            REVIEW="${REVIEW:0:$MAX}\n\n… _(truncated)_"
+          fi
+          {
+            echo 'body<<EOF'
+            echo "$REVIEW"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post review comment to PR
+        if: ${{ steps.diff.outputs.has_code == 'true' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `${{ steps.codex_review.outputs.body }}`.trim();
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: body || ":warning: Codex output was empty."
+            });
+
       - name: Skip – no code changes
         if: ${{ steps.diff.outputs.has_code != 'true' }}
         uses: actions/github-script@v7
@@ -89,33 +132,3 @@ jobs:
               issue_number: context.payload.pull_request.number,
               body: ":white_check_mark: No *code* changes to review (configs/docs/assets excluded)."
             });
-
-      - name: Prepare brief review prompt
-        if: ${{ steps.diff.outputs.has_code == 'true' }}
-        run: |
-          cat > review_task.txt << 'PROMPT'
-          You are Codex in CI. Review ONLY the code changes in code_only.diff.
-          Focus on: correctness, logic, edge cases, security, performance, and local style.
-          Provide concise, actionable suggestions with small code blocks where helpful.
-          Output a single Markdown file pr-review.md (must-fix first).
-          PROMPT
-
-      - name: Run Codex review (code-only)
-        if: ${{ steps.diff.outputs.has_code == 'true' }}
-        run: |
-          codex exec "Read code_only.diff and follow review_task.txt. $(cat review_task.txt)"
-
-      - name: Post review comment to PR
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('pr-review.md', 'utf8');
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body
-            });
-
-
