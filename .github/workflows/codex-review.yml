@@ -13,30 +13,40 @@ jobs:
         with:
           fetch-depth: 0
       
-      # Try multiple config locations
-      - name: Disable web search tool
+      - name: Patch Codex to remove web_search
         run: |
-          mkdir -p ~/.config/codex
-          mkdir -p ~/.codex
-          cat <<EOF > ~/.config/codex/config.toml
-          [tools]
-          web_search = false
+          # Find and patch the codex binary or Python files
+          cat <<'EOF' > /tmp/patch_codex.sh
+          #!/bin/bash
+          # This will run after the action installs codex
+          sleep 2
+          
+          # Find codex installation
+          CODEX_PATH=$(which codex 2>/dev/null || find ~/.local -name "codex" 2>/dev/null | head -1)
+          
+          if [ ! -z "$CODEX_PATH" ]; then
+            echo "Found codex at: $CODEX_PATH"
+            # Try to find and patch config
+            CODEX_DIR=$(dirname "$CODEX_PATH")
+            find "$CODEX_DIR" -name "*.py" -o -name "*.json" | while read file; do
+              if grep -q "web_search" "$file" 2>/dev/null; then
+                echo "Patching $file"
+                sed -i 's/"web_search_preview"//g' "$file" 2>/dev/null || true
+                sed -i 's/web_search_preview//g' "$file" 2>/dev/null || true
+              fi
+            done
+          fi
           EOF
-          cat <<EOF > ~/.codex/config.toml
-          [tools]
-          web_search = false
-          EOF
+          chmod +x /tmp/patch_codex.sh
       
       - name: Run Codex Review with Azure OpenAI
         uses: gersmann/codex-review-action@v1
         env:
           OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/v1
-          CODEX_DISABLE_WEB_SEARCH: "true"
-          CODEX_WEB_SEARCH: "false"
+          OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/deployments/gpt-4o-mini
+          OPENAI_API_VERSION: "2024-08-01-preview"
         with:
           mode: review
           openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
           model: gpt-4o-mini
-          reasoning_effort: medium
           debug_level: 1
