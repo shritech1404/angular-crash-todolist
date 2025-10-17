@@ -1,4 +1,4 @@
-name: Codex PR Review (Azure OpenAI • Code Only)
+name: Codex PR Review (Code Only)
 
 on:
   pull_request:
@@ -18,32 +18,24 @@ jobs:
       AZURE_OPENAI_API_VERSION: preview
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
 
-      - name: Install Codex CLI
-        run: npm install -g @openai/codex
+      - run: npm i -g @openai/codex
+        name: Install Codex CLI
 
-      - name: Write Codex config (Azure OpenAI)
+      - name: Configure Codex (Azure OpenAI)
         run: |
           mkdir -p ~/.codex
           cat > ~/.codex/config.toml <<'EOF'
           model = "${{ env.CODEX_MODEL }}"
           model_provider = "azure"
-          model_reasoning_summary = "detailed"
-          model_verbosity = "medium"
           approval_policy = "on-request"
-          model_reasoning_effort = "high"
 
           [model_providers.azure]
-          name = "Azure"
           base_url = "${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/v1"
           http_headers = { "api-key" = "${{ secrets.AZURE_OPENAI_API_KEY }}" }
           wire_api = "responses"
@@ -51,56 +43,42 @@ jobs:
           EOF
 
       - name: Build code-only diff
-        id: codeonly
+        id: diff
         shell: bash
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
 
-          # List changed files between base and head SHAs
-          CHANGED=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          # List changed files
+          CHANGED=$(git diff --name-only "$BASE...$HEAD")
 
-          # Allow-list common code extensions (no configs / content)
-          # and HARD-EXCLUDE workflow/config & vendor/build paths.
-          CODE_ONLY=$(echo "$CHANGED" | \
-            grep -E '\.(c|cc|cpp|cxx|h|hpp|hh|m|mm|cs|go|java|kt|kts|ts|tsx|js|jsx|py|rb|rs|php|swift|scala|lua|pl|erl|ex|exs|r|sql|sh|bash|ps1|dart|vue|svelte|zig|cmake|mk|make|gradle|groovy)$' || true)
+          # Allow-list common code extensions; exclude workflows/config/docs/assets.
+          CODE=$(echo "$CHANGED" | \
+            grep -E '\.(c|cc|cpp|cxx|h|hpp|m|mm|cs|go|java|kt|kts|ts|tsx|js|jsx|py|rb|rs|php|swift|scala|lua|pl|ex|exs|sql|sh|bash|ps1|dart|vue|svelte|cmake|mk|Makefile|gradle|groovy|zig)$' || true)
 
-          # Exclude non-code & infra/config:
-          # - Workflows / GitHub config
-          # - Generic configs & metadata
-          # - Vendor/build artifacts
-          CODE_ONLY=$(echo "$CODE_ONLY" | \
-            grep -Ev '(^|/)\.github/|(^|/)azure-pipelines\.y[a]ml$|(^|/)Jenkinsfile$' | \
-            grep -Ev '\.(ya?ml|toml|ini|conf|json|lock|md|rst|txt|yml)$' | \
-            grep -Ev '(^|/)(dist|build|out|coverage|vendor|node_modules|\.git|\.husky|\.vscode|\.idea)($|/)' || true)
+          CODE=$(echo "$CODE" | \
+            grep -Ev '(^|/)\.github/|(^|/)node_modules/|(^|/)(dist|build|out|coverage|vendor)($|/)' | \
+            grep -Ev '\.(ya?ml|toml|ini|conf|json|lock|md|rst|txt|png|jpe?g|gif|svg|pdf)$' || true)
 
-          # Also exclude any leftover workflow files explicitly
-          CODE_ONLY=$(echo "$CODE_ONLY" | grep -Ev '(^|/)\.github/workflows/.*\.ya?ml$' || true)
+          printf "%s\n" $CODE > changed_code_files.txt || true
 
-          # Save the list for Codex
-          printf "%s\n" $CODE_ONLY > changed_code_files.txt || true
-
-          # If no code files remain, create an empty diff and flag 0
           if [ ! -s changed_code_files.txt ]; then
             : > code_only.diff
-            echo "count=0" >> "$GITHUB_OUTPUT"
+            echo "has_code=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Create a tight unified=0 diff for ONLY those files
-          git --no-pager diff --unified=0 "$BASE_SHA...$HEAD_SHA" -- $(tr '\n' ' ' < changed_code_files.txt) > code_only.diff || true
-
-          # If diff ended up empty (all deletions/renames filtered), mark 0
-          if [ ! -s code_only.diff ]; then
-            echo "count=0" >> "$GITHUB_OUTPUT"
+          git --no-pager diff --unified=0 "$BASE...$HEAD" -- $(tr '\n' ' ' < changed_code_files.txt) > code_only.diff || true
+          if [ -s code_only.diff ]; then
+            echo "has_code=true" >> $GITHUB_OUTPUT
           else
-            echo "count=1" >> "$GITHUB_OUTPUT"
+            echo "has_code=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: No code changes — post skip comment
-        if: ${{ steps.codeonly.outputs.count == '0' }}
+      - name: Skip – no code changes
+        if: ${{ steps.diff.outputs.has_code != 'true' }}
         uses: actions/github-script@v7
         with:
           script: |
@@ -108,40 +86,26 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.pull_request.number,
-              body: ":white_check_mark: Skipping Codex — no *code* changes to review (workflows/config/docs/assets were excluded)."
+              body: ":white_check_mark: No *code* changes to review (configs/docs/assets excluded)."
             });
 
-      - name: Prepare code-only review task
-        if: ${{ steps.codeonly.outputs.count == '1' }}
+      - name: Prepare brief review prompt
+        if: ${{ steps.diff.outputs.has_code == 'true' }}
         run: |
           cat > review_task.txt << 'PROMPT'
-          You are Codex running in CI on a GitHub Pull Request.
-
-          Only review CODE changes from code_only.diff.
-          Ignore workflows (.github/workflows/**), YAML/TOML/JSON configs, lockfiles, docs, media, generated and vendor/build outputs.
-
-          Inputs:
-            - changed_code_files.txt : newline list of code files that changed
-            - code_only.diff         : unified=0 diff for those files
-
-          Task:
-            - Analyze code_only.diff (open files as needed) for correctness, logic, API contracts, edge cases, security, performance, and repo style.
-            - Provide concrete suggestions with small code blocks / patch hunks where helpful.
-            - Be concise and actionable; prioritize must-fix items first.
-
-          Output:
-            - Write a single Markdown review to pr-review.md for posting as a PR comment.
+          You are Codex in CI. Review ONLY the code changes in code_only.diff.
+          Focus on: correctness, logic, edge cases, security, performance, and local style.
+          Provide concise, actionable suggestions with small code blocks where helpful.
+          Output a single Markdown file pr-review.md (must-fix first).
           PROMPT
 
       - name: Run Codex review (code-only)
-        if: ${{ steps.codeonly.outputs.count == '1' }}
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+        if: ${{ steps.diff.outputs.has_code == 'true' }}
         run: |
-          codex exec "Read code_only.diff and changed_code_files.txt, then follow review_task.txt. $(cat review_task.txt)"
+          codex exec "Read code_only.diff and follow review_task.txt. $(cat review_task.txt)"
 
       - name: Post review comment to PR
-        if: ${{ steps.codeonly.outputs.count == '1' && hashFiles('pr-review.md') != '' }}
+        if: ${{ steps.diff.outputs.has_code == 'true' && hashFiles('pr-review.md') != '' }}
         uses: actions/github-script@v7
         with:
           script: |
