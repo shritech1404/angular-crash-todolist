@@ -1,53 +1,113 @@
-name: Codex Review (Azure OpenAI)
+name: Codex PR Review (Azure OpenAI)
+
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+
 permissions:
-  contents: write
+  contents: read
   pull-requests: write
+
 jobs:
   review:
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
+
+    env:
+      # Set your Azure deployment / model name here (must match your Azure deployment)
+      CODEX_MODEL: gpt-4o-mini
+      # Optionally override the API version if you don’t want "preview"
+      AZURE_OPENAI_API_VERSION: preview
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      
-      - name: Patch Codex to remove web_search
-        run: |
-          # Find and patch the codex binary or Python files
-          cat <<'EOF' > /tmp/patch_codex.sh
-          #!/bin/bash
-          # This will run after the action installs codex
-          sleep 2
-          
-          # Find codex installation
-          CODEX_PATH=$(which codex 2>/dev/null || find ~/.local -name "codex" 2>/dev/null | head -1)
-          
-          if [ ! -z "$CODEX_PATH" ]; then
-            echo "Found codex at: $CODEX_PATH"
-            # Try to find and patch config
-            CODEX_DIR=$(dirname "$CODEX_PATH")
-            find "$CODEX_DIR" -name "*.py" -o -name "*.json" | while read file; do
-              if grep -q "web_search" "$file" 2>/dev/null; then
-                echo "Patching $file"
-                sed -i 's/"web_search_preview"//g' "$file" 2>/dev/null || true
-                sed -i 's/web_search_preview//g' "$file" 2>/dev/null || true
-              fi
-            done
-          fi
-          EOF
-          chmod +x /tmp/patch_codex.sh
-      
-      - name: Run Codex Review with Azure OpenAI
-        uses: gersmann/codex-review-action@v1
-        env:
-          OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
-          OPENAI_API_VERSION: "2024-08-01-preview"
-        with:
-          mode: review
-          openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          model: gpt-4o-mini
-          debug_level: 1
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex
+
+      - name: Write Codex config (Azure OpenAI)
+        # Creates ~/.codex/config.toml using the Azure example from feiskyer/codex-settings
+        # Replace the endpoint & key with your GitHub secrets
+        run: |
+          mkdir -p ~/.codex
+          cat > ~/.codex/config.toml <<'EOF'
+          # Codex CLI Configuration (Azure OpenAI)
+          model = "gpt-4o-mini"
+          model_provider = "azure"
+          model_reasoning_summary = "detailed"
+          model_verbosity = "medium"
+          approval_policy = "on-request"
+          model_reasoning_effort = "high"
+
+          [model_providers.azure]
+          name = "Azure"
+          # NOTE: include /openai/v1 suffix; base URL should be your Azure OpenAI endpoint
+          base_url = "${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/v1"
+          http_headers = { "api-key" = "${{ secrets.AZURE_OPENAI_API_KEY }}" }
+          wire_api = "responses"
+          query_params = { api-version = "2024-12-01-preview" }
+          EOF
+
+      - name: Prepare review prompt
+        id: prompt
+        run: |
+          cat > review_task.txt << 'PROMPT'
+          You are running inside a CI environment for a GitHub pull request.
+
+          Task: Perform a thorough PR review and produce a SINGLE Markdown report saved to pr-review.md that includes:
+          1) A high-level summary of changes.
+          2) Architectural/logic issues and risks.
+          3) Bug risks and edge cases.
+          4) Security and secrets hygiene notes.
+          5) Performance/complexity concerns.
+          6) Style/consistency findings aligned with common conventions in this repo.
+          7) Concrete, line-anchored suggestions (code blocks) where helpful.
+          8) A quick checklist of must-fix vs nice-to-have items.
+
+          Context:
+          - Repo is checked out at $GITHUB_WORKSPACE
+          - Base branch: $GITHUB_BASE_REF
+          - Head branch: $GITHUB_HEAD_REF
+          - PR number: $PR_NUMBER
+
+          Steps you may take (feel free to adjust):
+          - Inspect changed files: `git diff --name-only origin/$GITHUB_BASE_REF...HEAD`
+          - Generate diffs: `git --no-pager diff origin/$GITHUB_BASE_REF...HEAD -- <file>`
+          - Read files for deeper analysis.
+          - Do NOT push commits; only analyze and write pr-review.md to the workspace.
+
+          Output:
+          - Write the final review to pr-review.md in Markdown, suitable for posting as a PR comment.
+          PROMPT
+
+      - name: Run Codex to generate PR review
+        # Use codex exec so it’s non-interactive in CI
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          GITHUB_HEAD_REF: ${{ github.head_ref }}
+        run: |
+          # Give Codex the instruction and let it read the repo / run git commands
+          codex exec "$(cat review_task.txt)"
+
+      - name: Post review comment to PR
+        if: ${{ hashFiles('pr-review.md') != '' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('pr-review.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body
+            });
