@@ -53,7 +53,7 @@ jobs:
           base_url = "${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/v1"
           http_headers = { "api-key" = "${{ secrets.AZURE_OPENAI_API_KEY }}" }
           wire_api = "responses"
-          query_params = { api-version = "2024-12-01-preview" }
+          query_params = { api-version = "preview" }
           EOF
 
       - name: Prepare review prompt
@@ -111,3 +111,4 @@ jobs:
               issue_number: context.payload.pull_request.number,
               body
             });
+
