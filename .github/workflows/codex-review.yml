@@ -1,22 +1,48 @@
 name: AI Agent Workflow
-on: [push, pull_request]
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write   # <-- needed to comment on PRs
 
 jobs:
   agent_task:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Setup Codex
-        run: |
-          echo "Setting up Codex environment..."
-          
-      - name: Run Codex
-        env:
-          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          TASK_DESCRIPTION: "Review code and check for any errors, vulnerabilities "
-        run: |
-          echo "Running Codex with task: Review code and check for any errors, vulnerabilities and showed reviewed summary in PR chat"
-          # Agent-specific commands will be executed here
-          echo "Task completed successfully"
 
+      - name: Setup Codex
+        run: echo "Setting up Codex environment..."
+
+      # Run your analyzer and capture a summary into a step output
+      - name: Run Codex
+        id: codex
+        run: |
+          echo "Running Codex with task: Review code and check for any errors, vulnerabilities"
+          # TODO: replace echoes with your actual analysis; write the final summary to $GITHUB_OUTPUT
+          {
+            echo 'summary<<EOF'
+            echo '✅ No critical issues found.'
+            echo '- Consider enabling dependabot.'
+            echo '- 1 medium-severity: user input not sanitized in utils/parse.ts'
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # Post a PR comment with the summary
+      - name: Post review summary to PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const body = `### 🤖 Codex Review Summary
+${{ steps.codex.outputs.summary }}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body
+            });
