@@ -16,6 +16,7 @@ jobs:
           AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
           TASK_DESCRIPTION: "Review code and check for any errors, vulnerabilities "
         run: |
-          echo "Running Codex with task: Review code and check for any errors, vulnerabilities "
+          echo "Running Codex with task: Review code and check for any errors, vulnerabilities and showed reviewed summary in PR chat"
           # Agent-specific commands will be executed here
           echo "Task completed successfully"
+
