@@ -6,23 +6,141 @@ on:
 jobs:
   agent_review:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write   # needed to post review comments
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Setup Codex
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
         run: |
-          echo "Setting up Codex environment..."
-      
-      - name: Review PR using Codex
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Write review script
+        run: |
+          mkdir -p scripts
+          cat > scripts/codex_review.py << 'PY'
+import os, sys, json, textwrap, requests
+
+# --- Inputs from env ---
+repo      = os.environ["GITHUB_REPOSITORY"]          # e.g. owner/name
+pr_number = os.environ["PR_NUMBER"]
+gh_token  = os.environ["GITHUB_TOKEN"]
+
+# Azure OpenAI settings
+azure_key        = os.environ["AZURE_OPENAI_API_KEY"]
+azure_endpoint   = os.environ["AZURE_OPENAI_ENDPOINT"]       # e.g. https://your-resource.openai.azure.com
+azure_deployment = os.environ["AZURE_OPENAI_DEPLOYMENT"]     # e.g. gpt-4o, gpt-4.1, etc.
+azure_api_ver    = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+
+session = requests.Session()
+session.headers.update({"Authorization": f"Bearer {gh_token}",
+                        "Accept": "application/vnd.github+json"})
+
+def fetch_changed_patches():
+    files = []
+    url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/files?per_page=100"
+    while url:
+        r = session.get(url)
+        r.raise_for_status()
+        files.extend(r.json())
+        # pagination
+        url = None
+        if 'link' in r.headers:
+            for part in r.headers['link'].split(","):
+                if 'rel="next"' in part:
+                    url = part[part.find("<")+1:part.find(">")]
+                    break
+    # Build a compact diff from patches
+    chunks = []
+    for f in files:
+        patch = f.get("patch")
+        if not patch:
+            # binary or too large to show—just include filename marker
+            chunks.append(f"--- {f['filename']} (no textual patch)")
+            continue
+        # keep per-file length reasonable
+        if len(patch) > 20000:
+            patch = patch[:20000] + "\n... [truncated]"
+        chunks.append(f"--- {f['filename']}\n{patch}")
+    # cap total to fit model input comfortably
+    merged = "\n\n".join(chunks)
+    if len(merged) > 180000:
+        merged = merged[:180000] + "\n... [global truncation]"
+    return merged, files
+
+def call_azure_openai(system_prompt, user_prompt):
+    url = f"{azure_endpoint}/openai/deployments/{azure_deployment}/chat/completions?api-version={azure_api_ver}"
+    headers = {"Content-Type": "application/json", "api-key": azure_key}
+    body = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 1200
+    }
+    r = requests.post(url, headers=headers, data=json.dumps(body))
+    r.raise_for_status()
+    data = r.json()
+    return data["choices"][0]["message"]["content"].strip()
+
+def post_pr_comment(body):
+    url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
+    r = session.post(url, json={"body": body})
+    r.raise_for_status()
+
+def main():
+    diff_text, files = fetch_changed_patches()
+    if not files:
+        post_pr_comment("No changed files detected; nothing to review.")
+        return
+
+    system = (
+        "You are a senior code reviewer. Provide a concise, actionable PR review. "
+        "Focus on correctness bugs, security issues, race conditions, performance footguns, "
+        "API misuse, concurrency, resource leaks, and style consistency when impactful. "
+        "When relevant, show minimal code suggestions."
+    )
+
+    user = textwrap.dedent(f"""
+        Review the following pull request patch. 
+        Output sections: Summary, Risks, Security Notes, Suggestions, and LGTM/Blocking.
+
+        Patch:
+        ```
+        {diff_text}
+        ```
+    """)
+
+    try:
+        review = call_azure_openai(system, user)
+        post_pr_comment(f"🤖 **Codex Review**\n\n{review}")
+        print("Posted review comment.")
+    except requests.HTTPError as e:
+        print("Azure/GitHub API error:", e, file=sys.stderr)
+        print(getattr(e.response, "text", ""), file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+PY
+
+      - name: Run AI review
         env:
-          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+          # Optionally override if you use a different API version:
+          # AZURE_OPENAI_API_VERSION: "2024-10-21"
         run: |
           echo "Running Codex Review..."
-          # Replace this with the actual Codex CLI or API call
-          codex review --pr ${{ github.event.pull_request.number }} \
-                       --repo ${{ github.repository }} \
-                       --token $GITHUB_TOKEN \
-                       --api-key $AZURE_OPENAI_API_KEY \
-                       --task "Review pull request for code issues, style violations, and security vulnerabilities."
-          echo "Codex review completed successfully."
+          python scripts/codex_review.py
