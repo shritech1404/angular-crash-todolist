@@ -1,21 +1,173 @@
-name: AI Agent Workflow
-on: [push, pull_request]
+name: Codex PR Review (Full Repo • Code + Security + Perf)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
-  agent_task:
+  review:
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
+
+    env:
+      CODEX_MODEL: gpt-4o-mini
+      AZURE_OPENAI_API_VERSION: preview
+
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Setup Codex
+        with: { fetch-depth: 0 }
+
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+
+      - name: Install Codex CLI
+        run: npm i -g @openai/codex
+
+      - name: Configure Codex (Azure OpenAI)
         run: |
-          echo "Setting up Codex environment..."
-          
-      - name: Run Codex
+          mkdir -p ~/.codex
+          cat > ~/.codex/config.toml <<'EOF'
+          model = "${{ env.CODEX_MODEL }}"
+          model_provider = "azure"
+          approval_policy = "on-request"
+          model_reasoning_summary = "detailed"
+          model_reasoning_effort = "high"
+
+          [model_providers.azure]
+          name = "Azure"
+          base_url = "${{ secrets.AZURE_OPENAI_ENDPOINT }}/openai/v1"
+          http_headers = { "api-key" = "${{ secrets.AZURE_OPENAI_API_KEY }}" }
+          wire_api = "responses"
+          query_params = { api-version = "${{ env.AZURE_OPENAI_API_VERSION }}" }
+          EOF
+
+      # --- Collect PR-aware context + full-repo index ---------------------------------------
+      - name: Build PR context (including deletions) and full repo index
+        id: ctx
+        shell: bash
         env:
-          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          TASK_DESCRIPTION: "Review code and check for any errors, vulnerabilities "
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
-          echo "Running Codex with task: Review code and check for any errors, vulnerabilities "
-          # Agent-specific commands will be executed here
-          echo "Task completed successfully"
+          set -euo pipefail
+
+          # 1) Name-status diff for PR (captures D/M/A, including deletions)
+          git --no-pager diff --name-status "$BASE...$HEAD" > pr_name_status.txt || true
+
+          # 2) Extract deleted files
+          awk '$1 ~ /^D/ { print $2 }' pr_name_status.txt > pr_deleted_files.txt || true
+
+          # 3) Create a code-only full-repo index (allow-list common code + manifests)
+          git ls-files | \
+          grep -Ev '(^|/)(node_modules|vendor|dist|build|out|coverage|\.git|\.husky|\.vscode|\.idea)($|/)' | \
+          grep -E '\.(c|cc|cpp|cxx|h|hpp|hh|m|mm|cs|go|java|kt|kts|ts|tsx|js|jsx|py|rb|rs|php|swift|scala|lua|pl|ex|exs|r|sql|sh|bash|ps1|dart|vue|svelte|cmake|mk|Makefile|gradle|groovy|zig|proto|yaml|yml|toml|ini|conf|json|lock|pom\.xml|go\.mod|go\.sum|Cargo\.toml|Cargo\.lock|requirements\.txt|Pipfile|Pipfile\.lock|package\.json|pnpm-lock\.yaml|yarn\.lock)$' \
+          > repo_code_index.txt || true
+
+          # 4) Grep for references to deleted basenames (helps Codex find likely breakages)
+          : > deleted_usage_refs.txt
+          if [ -s pr_deleted_files.txt ]; then
+            while read -r path; do
+              base="$(basename "$path")"
+              name="${base%.*}"             # name without extension
+              [ -n "$name" ] || continue
+              # Search across repo (excluding heavy dirs)
+              grep -RIn --exclude-dir={node_modules,vendor,dist,build,out,coverage,.git} -- "$name" . || true
+            done < pr_deleted_files.txt >> deleted_usage_refs.txt || true
+          fi
+
+          # 5) Tight PR diff for changed code files (still helpful context)
+          CHANGED_CODE=$(git diff --name-only "$BASE...$HEAD" | \
+            grep -Ev '(^|/)(node_modules|vendor|dist|build|out|coverage|\.git|\.husky|\.vscode|\.idea)($|/)' || true)
+          if [ -n "$CHANGED_CODE" ]; then
+            git --no-pager diff --unified=0 "$BASE...$HEAD" -- $CHANGED_CODE > pr_code_only.diff || true
+          else
+            : > pr_code_only.diff
+          fi
+
+          # Quick signals for later conditions (not strictly required)
+          if [ -s pr_name_status.txt ]; then echo "has_pr_context=true" >> $GITHUB_OUTPUT; else echo "has_pr_context=false" >> $GITHUB_OUTPUT; fi
+
+      # --- Prepare Codex task ---------------------------------------------------------------
+      - name: Prepare comprehensive review prompt (full repo + PR awareness)
+        run: |
+          cat > review_task.txt << 'PROMPT'
+          You are Codex running in CI for a GitHub Pull Request.
+
+          GOALS:
+          1) **PR-AWARE IMPACT**: From pr_name_status.txt, list deleted files and analyze likely breakages
+             (missing imports, routes, test fixtures, assets). Use deleted_usage_refs.txt as hints.
+             Call out concrete failure modes (e.g., TS/JS import errors, Angular DI/provider issues, 404s, test compile fails).
+             For each, show **how to fix** with small patch/code snippets.
+          2) **FULL REPOSITORY REVIEW**: Holistically review the repository codebase (see repo_code_index.txt).
+             Focus on correctness, logic, API contracts, edge cases, and style consistency.
+             Prioritize entry points and files changed in this PR (pr_code_only.diff).
+          3) **VULNERABILITIES & SECRETS**: Do static checks:
+             - Hard-coded secrets/keys/tokens
+             - Insecure patterns (eval/Function, insecure random, weak hashing, outdated crypto, SQL injection, command injection, path traversal)
+             - Dependency risks via manifests (package.json, requirements.txt, go.mod, Cargo.toml, pom.xml, etc.)
+             - CORS/misconfig, unsafe HTTP usage
+             For each, assess likelihood/impact and propose **fixes**.
+          4) **PERFORMANCE**: Identify performance issues:
+             - Hot paths, N+1 queries, unnecessary re-renders, large bundle risks, sync I/O, blocking code on main thread
+             - Inefficient algorithms or missing memoization/caching
+             Provide **actionable improvements**.
+          5) **OUTPUT FORMAT**: Write a single concise Markdown report to STDOUT with sections:
+             - PR Impact: Deleted Files & Likely Errors (with fixes)
+             - Critical Bugs / Must-Fix
+             - Security & Vulnerabilities (with fixes)
+             - Performance (with improvements)
+             - Code Quality & Style
+             - Quick Checklist (must-fix first)
+             Reference file paths and, when useful, small code blocks.
+
+          AVAILABLE CONTEXT FILES IN WORKSPACE:
+            - pr_name_status.txt          (git name-status lines for this PR)
+            - pr_code_only.diff           (unified=0 diff for PR)
+            - pr_deleted_files.txt        (one path per deleted file)
+            - deleted_usage_refs.txt      (grep hits for deleted basenames across repo)
+            - repo_code_index.txt         (full-repo code + manifest file list)
+
+          INSTRUCTIONS:
+          - Read the above text files; open code files on demand as needed.
+          - Keep signal high; avoid restating diffs verbatim. Be specific and actionable.
+          - Include “how to fix” for every critical or likely issue you report.
+          PROMPT
+
+      # --- Run Codex and post directly to PR (no files written) -----------------------------
+      - name: Run Codex review (full repo, PR-aware)
+        id: codex_review
+        shell: bash
+        run: |
+          set -euo pipefail
+          REVIEW="$(codex exec "Read pr_name_status.txt, pr_code_only.diff, pr_deleted_files.txt, deleted_usage_refs.txt, and repo_code_index.txt. Then follow review_task.txt. $(cat review_task.txt)")" || true
+          if [ -z "$REVIEW" ]; then
+            REVIEW=":warning: Codex ran but produced no review output. Check CI logs."
+          fi
+          # Truncate to avoid excessive size (optional)
+          MAX=120000
+          if [ ${#REVIEW} -gt $MAX ]; then
+            REVIEW="${REVIEW:0:$MAX}\n\n… _(truncated)_"
+          fi
+          {
+            echo 'body<<EOF'
+            echo "$REVIEW"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post review comment to PR
+        uses: actions/github-script@v7
+        env:
+          REVIEW_BODY_JSON: ${{ toJson(steps.codex_review.outputs.body) }}
+        with:
+          script: |
+            const body = JSON.parse(process.env.REVIEW_BODY_JSON || '""').trim() || ":warning: Codex output was empty.";
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body
+            });
