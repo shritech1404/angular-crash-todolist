@@ -1,8 +1,10 @@
 name: AI Agent Workflow
-on: [push, pull_request]
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
 
 jobs:
-  agent_task:
+  agent_review:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -10,12 +12,17 @@ jobs:
       - name: Setup Codex
         run: |
           echo "Setting up Codex environment..."
-          
-      - name: Run Codex
+      
+      - name: Review PR using Codex
         env:
           AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          TASK_DESCRIPTION: "Review code and check for any errors, vulnerabilities "
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "Running Codex with task: Review code and check for any errors, vulnerabilities "
-          # Agent-specific commands will be executed here
-          echo "Task completed successfully"
+          echo "Running Codex Review..."
+          # Replace this with the actual Codex CLI or API call
+          codex review --pr ${{ github.event.pull_request.number }} \
+                       --repo ${{ github.repository }} \
+                       --token $GITHUB_TOKEN \
+                       --api-key $AZURE_OPENAI_API_KEY \
+                       --task "Review pull request for code issues, style violations, and security vulnerabilities."
+          echo "Codex review completed successfully."
