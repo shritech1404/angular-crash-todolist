@@ -1,4 +1,4 @@
-name: Codex PR Review (Code Only + Deletions & Errors)
+name: Codex PR Review (Repo + PR diff, vulns & perf)
 
 on:
   pull_request:
@@ -45,8 +45,9 @@ jobs:
           query_params = { api-version = "${{ env.AZURE_OPENAI_API_VERSION }}" }
           EOF
 
-      - name: Build code-only diff + change summary
-        id: diff
+      # Build PR context with explicit detection of DELETIONS and references likely to break.
+      - name: Build PR context (code-only + deletions)
+        id: prctx
         shell: bash
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
@@ -54,137 +55,158 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Name-status summary (handles A/M/D/R)
-          NAME_STATUS=$(git diff --name-status --find-renames "$BASE...$HEAD" || true)
-          echo "$NAME_STATUS" > name_status.txt
+          # All changes w/ status (A,M,D,R,C,T)
+          CHANGED_STATUS=$(git diff --name-status "$BASE...$HEAD" || true)
+          echo "$CHANGED_STATUS" > changed_status.txt
 
-          # Collect changed file paths (no prefixes)
-          CHANGED=$(echo "$NAME_STATUS" | awk '{print $2}' | sed '/^$/d' | sort -u)
+          # Extract deleted files
+          DELETED=$(echo "$CHANGED_STATUS" | awk '$1=="D"{print $2}')
+          echo "$DELETED" > deleted_files.txt
 
-          # Allow-list common code extensions
+          # Now derive "code-only" changed file list (including deletions) via allow-list.
+          CHANGED=$(echo "$CHANGED_STATUS" | awk '{print $2}')
           CODE=$(echo "$CHANGED" | \
-            grep -E '\.(c|cc|cpp|cxx|h|hpp|m|mm|cs|go|java|kt|kts|ts|tsx|js|jsx|py|rb|rs|php|swift|scala|lua|pl|ex|exs|sql|sh|bash|ps1|dart|vue|svelte|cmake|mk|Makefile|gradle|groovy|zig)$' || true)
+            grep -E '\.(c|cc|cpp|cxx|h|hpp|hh|m|mm|cs|go|java|kt|kts|ts|tsx|js|jsx|py|rb|rs|php|swift|scala|lua|pl|erl|ex|exs|r|sql|sh|bash|ps1|dart|vue|svelte|cmake|mk|make|Makefile|gradle|groovy|zig)$' || true)
 
-          # Exclude workflows/config/docs/assets/vendor/build outputs
+          # Exclude workflows/config/docs/assets/vendor/build
           CODE=$(echo "$CODE" | \
             grep -Ev '(^|/)\.github/|(^|/)node_modules/|(^|/)(dist|build|out|coverage|vendor)($|/)' | \
             grep -Ev '\.(ya?ml|toml|ini|conf|json|lock|md|rst|txt|png|jpe?g|gif|svg|pdf|map|min\.js)$' || true)
 
           printf "%s\n" $CODE > changed_code_files.txt || true
 
-          # Separate deleted files (for explicit callout)
-          DELETED=$(echo "$NAME_STATUS" | awk '$1 ~ /^D/ {print $2}')
-          echo "$DELETED" > deleted_code_files.txt
-
-          if [ ! -s changed_code_files.txt ]; then
-            : > code_only.diff
-            echo "has_code=false" >> $GITHUB_OUTPUT
+          # diff for code changes only (includes deleted file diffs via --diff-filter)
+          if [ -s changed_code_files.txt ]; then
+            git --no-pager diff --unified=0 --diff-filter=ACMRTD "$BASE...$HEAD" -- $(tr '\n' ' ' < changed_code_files.txt) > code_only.diff || true
           else
-            # Tight diff for ONLY those files
-            git --no-pager diff --unified=0 "$BASE...$HEAD" -- $(tr '\n' ' ' < changed_code_files.txt) > code_only.diff || true
-            if [ -s code_only.diff ]; then
-              echo "has_code=true" >> $GITHUB_OUTPUT
-            else
-              echo "has_code=false" >> $GITHUB_OUTPUT
-            fi
+            : > code_only.diff
           fi
 
-      # Optional: try to surface breakages from deletions with a quick build (best-effort)
-      - name: Quick TypeScript compile (best-effort)
-        id: buildcheck
-        if: ${{ steps.diff.outputs.has_code == 'true' }}
-        shell: bash
-        run: |
-          set +e
-          BUILD_LOG=""
-          if [ -f package.json ]; then
-            echo "Attempting npm ci + tsc (no emit) ..."
-            npm ci --no-audit --no-fund >/dev/null 2>&1
-            if npx --yes tsc --noEmit >tsc.out 2>tsc.err; then
-              echo "TS compile OK"
-            else
-              echo "TS compile FAILED"
-            fi
-            BUILD_LOG="$( (echo '--- TSC STDOUT ---'; cat tsc.out 2>/dev/null; echo; echo '--- TSC STDERR ---'; cat tsc.err 2>/dev/null) | sed -e 's/\r$//' )"
+          # Build a rough "impacted refs" search for deleted files (search in HEAD tree)
+          : > impacted_refs.txt
+          if [ -s deleted_files.txt ]; then
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              name="$(basename "$f")"
+              stem="${name%.*}"
+              # Search common reference patterns by stem; ignore binary
+              echo "### References possibly impacted by deletion of: $f" >> impacted_refs.txt
+              git grep -n -I -E "(^|[^A-Za-z0-9_])${stem}([^A-Za-z0-9_]|$)" || true >> impacted_refs.txt
+              echo "" >> impacted_refs.txt
+            done < deleted_files.txt
           fi
-          # Truncate to keep comment reasonable
-          MAX=60000
-          if [ ${#BUILD_LOG} -gt $MAX ]; then
-            BUILD_LOG="${BUILD_LOG:0:$MAX}\n… (truncated)"
-          fi
-          {
-            echo 'log<<EOF'
-            echo "${BUILD_LOG}"
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
 
-      - name: Run Codex review (no file)
-        id: codex_review
-        if: ${{ steps.diff.outputs.has_code == 'true' }}
+          # Expose “has_code_changes” and “has_deletions” as step outputs
+          if [ -s code_only.diff ]; then
+            echo "has_code_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_code_changes=false" >> $GITHUB_OUTPUT
+          fi
+          if [ -s deleted_files.txt ] && [ -n "$(grep -v '^[[:space:]]*$' deleted_files.txt)" ]; then
+            echo "has_deletions=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_deletions=false" >> $GITHUB_OUTPUT
+          fi
+
+      # =============================
+      # 1) PR-DIFF REVIEW (mentions deleted files + breakages)
+      # =============================
+      - name: Codex – PR review (diff + deletions)
+        id: pr_review
+        if: ${{ steps.prctx.outputs.has_code_changes == 'true' || steps.prctx.outputs.has_deletions == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
-          # Capture supporting context for Codex
-          NAME_STATUS="$(cat name_status.txt || true)"
-          DELETED_LIST="$(grep -v '^\s*$' deleted_code_files.txt || true)"
-          BUILD_LOG="${{ steps.buildcheck.outputs.log }}"
+          REVIEW="$(codex exec "You are Codex in CI for a Pull Request.
 
-          read -r -d '' EXTRA_CONTEXT <<'CTX' || true
-          === Change Summary (git diff --name-status) ===
-          ${NAME_STATUS}
+          Inputs in workspace:
+          - changed_status.txt : 'git diff --name-status' between base..head
+          - changed_code_files.txt : code files that changed
+          - code_only.diff : unified=0 diff for those code files
+          - deleted_files.txt : list of deleted files (if any)
+          - impacted_refs.txt : grep hits in HEAD that may reference deleted files
 
-          === Deleted files ===
-          ${DELETED_LIST:-<none>}
+          Task:
+          - Produce a concise PR review that MUST:
+            * Summarize code changes from code_only.diff (no restating hunks).
+            * Explicitly list deleted code files (deleted_files.txt) and analyze likely impact.
+            * Use impacted_refs.txt to call out code that may now fail (imports/usage).
+            * Provide actionable fixes with small code blocks or patch suggestions.
+            * Prioritize must-fix items first; then nice-to-haves.
+          - Keep the output suitable as a PR comment in Markdown.")" || true
 
-          === Build / TypeScript check (best-effort) ===
-          ${BUILD_LOG:-<not run or empty>}
-          CTX
+          [ -z "$REVIEW" ] && REVIEW=":warning: Codex PR-diff review produced no output."
 
-          # Minimal, explicit instructions for deletions & fallout
-          read -r -d '' REVIEW_TASK <<'PROMPT' || true
-          You are Codex in CI.
-          Review ONLY the code changes in code_only.diff.
-          MUST include a section: "Deleted files & fallout"
-           - List each deleted file (if any)
-           - Check for references/imports to those files across the repo and call out likely breakages
-           - Suggest concrete fixes (e.g., remove stale imports, update module/barrel/index, adjust tsconfig paths)
-
-          Also include:
-           - Must-fix issues first (correctness/security/runtime errors)
-           - Edge cases and performance notes
-           - Small suggested patches where helpful
-
-          You are provided:
-           - code_only.diff : unified=0 diff for code files
-           - Change summary / Deleted files
-           - Optional TypeScript build errors
-
-          Output to STDOUT only. Keep it concise and actionable.
-          PROMPT
-
-          REVIEW="$(codex exec "Read code_only.diff. Use this context:\n\n${EXTRA_CONTEXT}\n\nThen follow these instructions:\n${REVIEW_TASK}")" || true
-          if [ -z "$REVIEW" ]; then
-            REVIEW=":warning: Codex ran but produced no review output. Check CI logs."
-          fi
-          # Optional truncation
-          MAX=120000
-          if [ ${#REVIEW} -gt $MAX ]; then
-            REVIEW="${REVIEW:0:$MAX}\n\n… _(truncated)_"
-          fi
           {
             echo 'body<<EOF'
             echo "$REVIEW"
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
+      # =============================
+      # 2) FULL-REPO REVIEW (like "codex review" of the codebase)
+      #    Includes vulnerability & performance passes
+      # =============================
+      - name: Codex – full repo review (security + performance)
+        id: repo_review
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Build a repo code inventory (lightweight list)
+          git ls-files > repo_files_all.txt
+          grep -E '\.(c|cc|cpp|cxx|h|hpp|hh|m|mm|cs|go|java|kt|kts|ts|tsx|js|jsx|py|rb|rs|php|swift|scala|lua|pl|erl|ex|exs|r|sql|sh|bash|ps1|dart|vue|svelte|cmake|mk|make|Makefile|gradle|groovy|zig)$' repo_files_all.txt \
+            | grep -Ev '(^|/)\.github/|(^|/)node_modules/|(^|/)(dist|build|out|coverage|vendor)($|/)' \
+            > repo_code_files.txt || true
+
+          REVIEW="$(codex exec "You are Codex performing a whole-repository code review (similar to 'codex review').
+
+          Inputs in workspace:
+          - repo_code_files.txt : list of code files in the repo to consider
+
+          Tasks (produce one Markdown report):
+          1) GENERAL CODE HEALTH:
+             - Identify architectural risks, dead code, missing tests, unclear boundaries.
+          2) VULNERABILITIES:
+             - Look for insecure patterns (injection, unsafe eval/exec, command/FS access, weak crypto, SSRF, hard-coded secrets).
+             - Call out risky dependencies *by usage* (e.g., unsafe libs/patterns) even if lockfiles are excluded.
+             - Suggest concrete mitigations or safer APIs.
+          3) PERFORMANCE:
+             - Flag hot paths with obvious inefficiencies (O(n^2), N+1 queries, unnecessary sync I/O, large JSON/string copies, blocking operations on hot paths).
+             - Recommend optimizations or algorithmic improvements with code samples.
+          4) PRIORITIZED ACTIONS:
+             - Provide a checklist of MUST-FIX vs NICE-TO-HAVE items with file/line anchors where possible.
+
+          You may open files from repo_code_files.txt to inspect details. Keep the output compact and actionable.")" || true
+
+          [ -z "$REVIEW" ] && REVIEW=":warning: Codex full-repo review produced no output."
+
+          {
+            echo 'body<<EOF'
+            echo "$REVIEW"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # Combine both reviews and post a single PR comment (no temp files committed)
       - name: Post review comment to PR
-        if: ${{ steps.diff.outputs.has_code == 'true' }}
         uses: actions/github-script@v7
         env:
-          REVIEW_BODY_JSON: ${{ toJson(steps.codex_review.outputs.body) }}
+          PR_REVIEW_JSON:   ${{ toJson(steps.pr_review.outputs.body) }}
+          REPO_REVIEW_JSON: ${{ toJson(steps.repo_review.outputs.body) }}
         with:
           script: |
-            const body = JSON.parse(process.env.REVIEW_BODY_JSON || '""').trim() || ":warning: Codex output was empty.";
+            const prReview   = JSON.parse(process.env.PR_REVIEW_JSON   || '""');
+            const repoReview = JSON.parse(process.env.REPO_REVIEW_JSON || '""');
+
+            const parts = [];
+            if (prReview) {
+              parts.push("## PR Review (Diff & Deletions)\n\n" + prReview.trim());
+            }
+            if (repoReview) {
+              parts.push("\n---\n\n## Full Repo Review (Vulnerabilities & Performance)\n\n" + repoReview.trim());
+            }
+            const body = (parts.join("\n\n") || ":warning: No review output generated.").trim();
+
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -192,8 +214,9 @@ jobs:
               body
             });
 
-      - name: Skip – no code changes
-        if: ${{ steps.diff.outputs.has_code != 'true' }}
+      # Optional: if absolutely nothing to say, post a friendly note
+      - name: Fallback – nothing to review
+        if: ${{ steps.prctx.outputs.has_code_changes != 'true' && steps.prctx.outputs.has_deletions != 'true' }}
         uses: actions/github-script@v7
         with:
           script: |
@@ -201,5 +224,5 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.pull_request.number,
-              body: ":white_check_mark: No *code* changes to review (configs/docs/assets excluded)."
+              body: ":white_check_mark: No code changes detected and no deletions; posted full repo review above."
             });
