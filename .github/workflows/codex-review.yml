@@ -1,4 +1,4 @@
-name: Codex PR Review (Code Only)
+name: Codex PR Review (Code Only + Deletions & Errors)
 
 on:
   pull_request:
@@ -45,7 +45,7 @@ jobs:
           query_params = { api-version = "${{ env.AZURE_OPENAI_API_VERSION }}" }
           EOF
 
-      - name: Build code-only diff
+      - name: Build code-only diff + change summary
         id: diff
         shell: bash
         env:
@@ -54,8 +54,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # List changed files
-          CHANGED=$(git diff --name-only "$BASE...$HEAD" || true)
+          # Name-status summary (handles A/M/D/R)
+          NAME_STATUS=$(git diff --name-status --find-renames "$BASE...$HEAD" || true)
+          echo "$NAME_STATUS" > name_status.txt
+
+          # Collect changed file paths (no prefixes)
+          CHANGED=$(echo "$NAME_STATUS" | awk '{print $2}' | sed '/^$/d' | sort -u)
 
           # Allow-list common code extensions
           CODE=$(echo "$CHANGED" | \
@@ -66,33 +70,53 @@ jobs:
             grep -Ev '(^|/)\.github/|(^|/)node_modules/|(^|/)(dist|build|out|coverage|vendor)($|/)' | \
             grep -Ev '\.(ya?ml|toml|ini|conf|json|lock|md|rst|txt|png|jpe?g|gif|svg|pdf|map|min\.js)$' || true)
 
-          # Save file list (may be empty)
           printf "%s\n" $CODE > changed_code_files.txt || true
+
+          # Separate deleted files (for explicit callout)
+          DELETED=$(echo "$NAME_STATUS" | awk '$1 ~ /^D/ {print $2}')
+          echo "$DELETED" > deleted_code_files.txt
 
           if [ ! -s changed_code_files.txt ]; then
             : > code_only.diff
             echo "has_code=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # Tight diff for ONLY those files
-          git --no-pager diff --unified=0 "$BASE...$HEAD" -- $(tr '\n' ' ' < changed_code_files.txt) > code_only.diff || true
-
-          if [ -s code_only.diff ]; then
-            echo "has_code=true" >> $GITHUB_OUTPUT
           else
-            echo "has_code=false" >> $GITHUB_OUTPUT
+            # Tight diff for ONLY those files
+            git --no-pager diff --unified=0 "$BASE...$HEAD" -- $(tr '\n' ' ' < changed_code_files.txt) > code_only.diff || true
+            if [ -s code_only.diff ]; then
+              echo "has_code=true" >> $GITHUB_OUTPUT
+            else
+              echo "has_code=false" >> $GITHUB_OUTPUT
+            fi
           fi
 
-      - name: Prepare brief review prompt
+      # Optional: try to surface breakages from deletions with a quick build (best-effort)
+      - name: Quick TypeScript compile (best-effort)
+        id: buildcheck
         if: ${{ steps.diff.outputs.has_code == 'true' }}
+        shell: bash
         run: |
-          cat > review_task.txt << 'PROMPT'
-          You are Codex in CI. Review ONLY the code changes in code_only.diff.
-          Focus on: correctness, logic, edge cases, security, performance, and local style.
-          Provide concise, actionable suggestions with small code blocks where helpful.
-          Output to STDOUT (no files). Put must-fix items first.
-          PROMPT
+          set +e
+          BUILD_LOG=""
+          if [ -f package.json ]; then
+            echo "Attempting npm ci + tsc (no emit) ..."
+            npm ci --no-audit --no-fund >/dev/null 2>&1
+            if npx --yes tsc --noEmit >tsc.out 2>tsc.err; then
+              echo "TS compile OK"
+            else
+              echo "TS compile FAILED"
+            fi
+            BUILD_LOG="$( (echo '--- TSC STDOUT ---'; cat tsc.out 2>/dev/null; echo; echo '--- TSC STDERR ---'; cat tsc.err 2>/dev/null) | sed -e 's/\r$//' )"
+          fi
+          # Truncate to keep comment reasonable
+          MAX=60000
+          if [ ${#BUILD_LOG} -gt $MAX ]; then
+            BUILD_LOG="${BUILD_LOG:0:$MAX}\n… (truncated)"
+          fi
+          {
+            echo 'log<<EOF'
+            echo "${BUILD_LOG}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Run Codex review (no file)
         id: codex_review
@@ -100,11 +124,49 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          REVIEW="$(codex exec "Read code_only.diff and follow review_task.txt. $(cat review_task.txt)")" || true
+          # Capture supporting context for Codex
+          NAME_STATUS="$(cat name_status.txt || true)"
+          DELETED_LIST="$(grep -v '^\s*$' deleted_code_files.txt || true)"
+          BUILD_LOG="${{ steps.buildcheck.outputs.log }}"
+
+          read -r -d '' EXTRA_CONTEXT <<'CTX' || true
+          === Change Summary (git diff --name-status) ===
+          ${NAME_STATUS}
+
+          === Deleted files ===
+          ${DELETED_LIST:-<none>}
+
+          === Build / TypeScript check (best-effort) ===
+          ${BUILD_LOG:-<not run or empty>}
+          CTX
+
+          # Minimal, explicit instructions for deletions & fallout
+          read -r -d '' REVIEW_TASK <<'PROMPT' || true
+          You are Codex in CI.
+          Review ONLY the code changes in code_only.diff.
+          MUST include a section: "Deleted files & fallout"
+           - List each deleted file (if any)
+           - Check for references/imports to those files across the repo and call out likely breakages
+           - Suggest concrete fixes (e.g., remove stale imports, update module/barrel/index, adjust tsconfig paths)
+
+          Also include:
+           - Must-fix issues first (correctness/security/runtime errors)
+           - Edge cases and performance notes
+           - Small suggested patches where helpful
+
+          You are provided:
+           - code_only.diff : unified=0 diff for code files
+           - Change summary / Deleted files
+           - Optional TypeScript build errors
+
+          Output to STDOUT only. Keep it concise and actionable.
+          PROMPT
+
+          REVIEW="$(codex exec "Read code_only.diff. Use this context:\n\n${EXTRA_CONTEXT}\n\nThen follow these instructions:\n${REVIEW_TASK}")" || true
           if [ -z "$REVIEW" ]; then
             REVIEW=":warning: Codex ran but produced no review output. Check CI logs."
           fi
-          # Optional truncation to avoid any size limits
+          # Optional truncation
           MAX=120000
           if [ ${#REVIEW} -gt $MAX ]; then
             REVIEW="${REVIEW:0:$MAX}\n\n… _(truncated)_"
@@ -122,7 +184,6 @@ jobs:
           REVIEW_BODY_JSON: ${{ toJson(steps.codex_review.outputs.body) }}
         with:
           script: |
-            // Safely parse multi-line body from env (avoids JS parsing issues)
             const body = JSON.parse(process.env.REVIEW_BODY_JSON || '""').trim() || ":warning: Codex output was empty.";
             await github.rest.issues.createComment({
               owner: context.repo.owner,
