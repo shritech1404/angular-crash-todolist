@@ -1,4 +1,4 @@
-name: Codex PR Review (Full Repo • Code + Security + Perf)
+name: Codex PR Review (Full Repo + Deletion Impact)
 
 on:
   pull_request:
@@ -45,8 +45,8 @@ jobs:
           query_params = { api-version = "${{ env.AZURE_OPENAI_API_VERSION }}" }
           EOF
 
-      # --- Collect PR-aware context + full-repo index ---------------------------------------
-      - name: Build PR context (including deletions) and full repo index
+      # Build context for Codex: list deleted files (D), changed files, and language mix.
+      - name: Build PR context (deleted files, changed files, languages)
         id: ctx
         shell: bash
         env:
@@ -55,99 +55,92 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 1) Name-status diff for PR (captures D/M/A, including deletions)
+          # Diff summary (names & statuses)
           git --no-pager diff --name-status "$BASE...$HEAD" > pr_name_status.txt || true
+          git --no-pager diff --name-only  "$BASE...$HEAD" > pr_changed_files.txt || true
+          awk '$1=="D"{print $2}' pr_name_status.txt > pr_deleted_files.txt || true
 
-          # 2) Extract deleted files
-          awk '$1 ~ /^D/ { print $2 }' pr_name_status.txt > pr_deleted_files.txt || true
+          # Language mix (rough)
+          git ls-files | awk -F. 'NF>1{print $NF}' | tr '[:upper:]' '[:lower:]' | sort | uniq -c | sort -nr > repo_lang_mix.txt || true
 
-          # 3) Create a code-only full-repo index (allow-list common code + manifests)
-          git ls-files | \
-          grep -Ev '(^|/)(node_modules|vendor|dist|build|out|coverage|\.git|\.husky|\.vscode|\.idea)($|/)' | \
-          grep -E '\.(c|cc|cpp|cxx|h|hpp|hh|m|mm|cs|go|java|kt|kts|ts|tsx|js|jsx|py|rb|rs|php|swift|scala|lua|pl|ex|exs|r|sql|sh|bash|ps1|dart|vue|svelte|cmake|mk|Makefile|gradle|groovy|zig|proto|yaml|yml|toml|ini|conf|json|lock|pom\.xml|go\.mod|go\.sum|Cargo\.toml|Cargo\.lock|requirements\.txt|Pipfile|Pipfile\.lock|package\.json|pnpm-lock\.yaml|yarn\.lock)$' \
-          > repo_code_index.txt || true
+          # Tight diff for ALL changes for impact reasoning (includes deletions metadata)
+          git --no-pager diff --unified=0 "$BASE...$HEAD" > pr_unified0.diff || true
 
-          # 4) Grep for references to deleted basenames (helps Codex find likely breakages)
-          : > deleted_usage_refs.txt
-          if [ -s pr_deleted_files.txt ]; then
-            while read -r path; do
-              base="$(basename "$path")"
-              name="${base%.*}"             # name without extension
-              [ -n "$name" ] || continue
-              # Search across repo (excluding heavy dirs)
-              grep -RIn --exclude-dir={node_modules,vendor,dist,build,out,coverage,.git} -- "$name" . || true
-            done < pr_deleted_files.txt >> deleted_usage_refs.txt || true
-          fi
+          # Expose counts as outputs
+          echo "deleted_count=$(wc -l < pr_deleted_files.txt | tr -d ' ')" >> $GITHUB_OUTPUT
+          echo "changed_count=$(wc -l < pr_changed_files.txt | tr -d ' ')" >> $GITHUB_OUTPUT
 
-          # 5) Tight PR diff for changed code files (still helpful context)
-          CHANGED_CODE=$(git diff --name-only "$BASE...$HEAD" | \
-            grep -Ev '(^|/)(node_modules|vendor|dist|build|out|coverage|\.git|\.husky|\.vscode|\.idea)($|/)' || true)
-          if [ -n "$CHANGED_CODE" ]; then
-            git --no-pager diff --unified=0 "$BASE...$HEAD" -- $CHANGED_CODE > pr_code_only.diff || true
-          else
-            : > pr_code_only.diff
-          fi
-
-          # Quick signals for later conditions (not strictly required)
-          if [ -s pr_name_status.txt ]; then echo "has_pr_context=true" >> $GITHUB_OUTPUT; else echo "has_pr_context=false" >> $GITHUB_OUTPUT; fi
-
-      # --- Prepare Codex task ---------------------------------------------------------------
-      - name: Prepare comprehensive review prompt (full repo + PR awareness)
+      # Prepare a comprehensive review prompt to scan the *whole repo* and also reason about the *diff*
+      - name: Prepare full-repo review prompt
         run: |
           cat > review_task.txt << 'PROMPT'
-          You are Codex running in CI for a GitHub Pull Request.
+          You are Codex running in CI on a GitHub Pull Request.
 
-          GOALS:
-          1) **PR-AWARE IMPACT**: From pr_name_status.txt, list deleted files and analyze likely breakages
-             (missing imports, routes, test fixtures, assets). Use deleted_usage_refs.txt as hints.
-             Call out concrete failure modes (e.g., TS/JS import errors, Angular DI/provider issues, 404s, test compile fails).
-             For each, show **how to fix** with small patch/code snippets.
-          2) **FULL REPOSITORY REVIEW**: Holistically review the repository codebase (see repo_code_index.txt).
-             Focus on correctness, logic, API contracts, edge cases, and style consistency.
-             Prioritize entry points and files changed in this PR (pr_code_only.diff).
-          3) **VULNERABILITIES & SECRETS**: Do static checks:
-             - Hard-coded secrets/keys/tokens
-             - Insecure patterns (eval/Function, insecure random, weak hashing, outdated crypto, SQL injection, command injection, path traversal)
-             - Dependency risks via manifests (package.json, requirements.txt, go.mod, Cargo.toml, pom.xml, etc.)
-             - CORS/misconfig, unsafe HTTP usage
-             For each, assess likelihood/impact and propose **fixes**.
-          4) **PERFORMANCE**: Identify performance issues:
-             - Hot paths, N+1 queries, unnecessary re-renders, large bundle risks, sync I/O, blocking code on main thread
-             - Inefficient algorithms or missing memoization/caching
-             Provide **actionable improvements**.
-          5) **OUTPUT FORMAT**: Write a single concise Markdown report to STDOUT with sections:
-             - PR Impact: Deleted Files & Likely Errors (with fixes)
-             - Critical Bugs / Must-Fix
-             - Security & Vulnerabilities (with fixes)
-             - Performance (with improvements)
-             - Code Quality & Style
-             - Quick Checklist (must-fix first)
-             Reference file paths and, when useful, small code blocks.
+          GOAL
+          - Perform a FULL-REPOSITORY code review (not just the diff).
+          - ALSO analyze the PR diff to identify *deleted files* and explain likely runtime/build errors caused by those deletions (e.g., broken imports, missing exports, removed assets).
+          - Produce a single, concise Markdown review formatted for a PR comment.
 
-          AVAILABLE CONTEXT FILES IN WORKSPACE:
-            - pr_name_status.txt          (git name-status lines for this PR)
-            - pr_code_only.diff           (unified=0 diff for PR)
-            - pr_deleted_files.txt        (one path per deleted file)
-            - deleted_usage_refs.txt      (grep hits for deleted basenames across repo)
-            - repo_code_index.txt         (full-repo code + manifest file list)
+          INPUT ARTIFACTS YOU CAN READ
+          - pr_unified0.diff          : tight diff (unified=0) between base and head
+          - pr_name_status.txt        : lines like "D\tpath/file", "M\tpath/file", etc.
+          - pr_deleted_files.txt      : just the paths that were deleted in this PR
+          - pr_changed_files.txt      : all changed file paths
+          - repo_lang_mix.txt         : language/extension distribution
+          - The full repository workspace is available read-only (git ls-files, cat files, etc).
 
-          INSTRUCTIONS:
-          - Read the above text files; open code files on demand as needed.
-          - Keep signal high; avoid restating diffs verbatim. Be specific and actionable.
-          - Include “how to fix” for every critical or likely issue you report.
+          REQUIRED CHECKS (cover the entire repo; mention high-priority issues first)
+          1) DELETION IMPACT
+             - If files were deleted: locate any references/usages (imports/require/includes/routes/assets) that will break.
+             - Explain exact failure modes (e.g., TS compile error, runtime module-not-found, 404 asset) and in which files/lines they are likely to occur.
+             - Provide concrete fixes or alternatives (restore, update imports, adjust DI/registrations, route changes, etc.) with small code blocks.
+
+          2) VULNERABILITIES
+             - Look for insecure patterns & libraries (dangerous eval, unsanitized input, SQL/NoSQL injection, XSS, CSRF, insecure crypto, weak hashing, insecure HTTP).
+             - Point to files/lines where they appear and give minimal secure fixes.
+             - If package manifests exist (package.json, requirements.txt, etc.), review for risky deps by name or known insecure patterns (no internet lookups).
+
+          3) PERFORMANCE
+             - Flag N+1 queries, heavy loops, unnecessary re-renders, large bundle patterns, blocking I/O, synchronous waits, unbounded retries, memory leaks.
+             - Provide small optimized snippets or actionable suggestions.
+
+          4) SECRETS / SENSITIVE DATA
+             - Detect potential hardcoded secrets/tokens/keys/credentials and accidental logging of secrets/PII.
+             - For any suspect string, show a short safe excerpt (mask most of the value) and file/line.
+
+          5) CODE DUPLICATION / STRUCTURE
+             - Identify obvious duplicate functions/logic across files (heuristic scan).
+             - Suggest DRY refactors (shared utils/hooks/services), with brief example.
+
+          6) STYLE / CONSISTENCY
+             - Note key style inconsistencies that harm readability/maintainability (naming, null handling, error handling).
+          
+          OUTPUT FORMAT
+          - Title, then sections:
+            - Summary
+            - Deletion Impact (with file paths and probable errors)
+            - Vulnerabilities (with file/line & quick fixes)
+            - Performance
+            - Hardcoded Secrets
+            - Code Duplication
+            - Style & Consistency
+            - Must-Fix Checklist
+          - Keep it focused. Include small code blocks for fixes where helpful.
           PROMPT
 
-      # --- Run Codex and post directly to PR (no files written) -----------------------------
-      - name: Run Codex review (full repo, PR-aware)
+      # Run Codex across the full repo; no file artifacts are created—capture STDOUT and post.
+      - name: Run Codex full-repo review (no files)
         id: codex_review
         shell: bash
         run: |
           set -euo pipefail
-          REVIEW="$(codex exec "Read pr_name_status.txt, pr_code_only.diff, pr_deleted_files.txt, deleted_usage_refs.txt, and repo_code_index.txt. Then follow review_task.txt. $(cat review_task.txt)")" || true
+          REVIEW="$(
+            codex exec "Read pr_unified0.diff, pr_name_status.txt, pr_deleted_files.txt, pr_changed_files.txt, repo_lang_mix.txt, then follow review_task.txt. $(cat review_task.txt)"
+          )" || true
           if [ -z "$REVIEW" ]; then
             REVIEW=":warning: Codex ran but produced no review output. Check CI logs."
           fi
-          # Truncate to avoid excessive size (optional)
+          # Truncate if extremely long
           MAX=120000
           if [ ${#REVIEW} -gt $MAX ]; then
             REVIEW="${REVIEW:0:$MAX}\n\n… _(truncated)_"
