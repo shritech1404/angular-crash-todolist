@@ -1,11 +1,12 @@
-name: Codex PR Review
+name: Codex PR Review (Repo-wide + Deleted Files + Sec/Perf/Secrets/Dup + README auto)
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
-  contents: read
+  # Needed to push README updates to the PR branch in same-repo PRs
+  contents: write
   pull-requests: write
 
 jobs:
@@ -18,8 +19,12 @@ jobs:
       AZURE_OPENAI_API_VERSION: preview
 
     steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          # Check out the contributor branch so we can commit README updates back to it
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
@@ -45,9 +50,9 @@ jobs:
           query_params = { api-version = "${{ env.AZURE_OPENAI_API_VERSION }}" }
           EOF
 
-      # --- Collect PR-aware context + full-repo index ---------------------------------------
-      - name: Build PR context (including deletions) and full repo index
-        id: ctx
+      # Build repo inventory, deletions, and a focused diff (context only).
+      - name: Build repo inventory + deletions + diff
+        id: inv
         shell: bash
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
@@ -55,110 +60,92 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 1) Name-status diff for PR (captures D/M/A, including deletions)
-          git --no-pager diff --name-status "$BASE...$HEAD" > pr_name_status.txt || true
+          # All tracked files
+          git ls-files > all_files.txt
 
-          # 2) Extract deleted files
-          awk '$1 ~ /^D/ { print $2 }' pr_name_status.txt > pr_deleted_files.txt || true
+          # Allow-list common code extensions; exclude docs/assets/vendor/build/etc.
+          CODE=$(cat all_files.txt | \
+            grep -E '\.(c|cc|cpp|cxx|h|hpp|hh|m|mm|cs|go|java|kt|kts|ts|tsx|js|jsx|py|rb|rs|php|swift|scala|lua|pl|erl|ex|exs|r|sql|sh|bash|ps1|dart|vue|svelte|cmake|mk|Makefile|gradle|groovy|zig)$' || true)
 
-          # 3) Create a code-only full-repo index (allow-list common code + manifests)
-          git ls-files | \
-          grep -Ev '(^|/)(node_modules|vendor|dist|build|out|coverage|\.git|\.husky|\.vscode|\.idea)($|/)' | \
-          grep -E '\.(c|cc|cpp|cxx|h|hpp|hh|m|mm|cs|go|java|kt|kts|ts|tsx|js|jsx|py|rb|rs|php|swift|scala|lua|pl|ex|exs|r|sql|sh|bash|ps1|dart|vue|svelte|cmake|mk|Makefile|gradle|groovy|zig|proto|yaml|yml|toml|ini|conf|json|lock|pom\.xml|go\.mod|go\.sum|Cargo\.toml|Cargo\.lock|requirements\.txt|Pipfile|Pipfile\.lock|package\.json|pnpm-lock\.yaml|yarn\.lock)$' \
-          > repo_code_index.txt || true
+          CODE=$(echo "$CODE" | \
+            grep -Ev '(^|/)\.github/|(^|/)node_modules/|(^|/)(dist|build|out|coverage|vendor)($|/)' | \
+            grep -Ev '\.(ya?ml|toml|ini|conf|json|lock|md|rst|txt|png|jpe?g|gif|svg|pdf|map|min\.js)$' || true)
 
-          # 4) Grep for references to deleted basenames (helps Codex find likely breakages)
-          : > deleted_usage_refs.txt
-          if [ -s pr_deleted_files.txt ]; then
-            while read -r path; do
-              base="$(basename "$path")"
-              name="${base%.*}"             # name without extension
-              [ -n "$name" ] || continue
-              # Search across repo (excluding heavy dirs)
-              grep -RIn --exclude-dir={node_modules,vendor,dist,build,out,coverage,.git} -- "$name" . || true
-            done < pr_deleted_files.txt >> deleted_usage_refs.txt || true
-          fi
+          printf "%s\n" $CODE > repo_code_files.txt || true
 
-          # 5) Tight PR diff for changed code files (still helpful context)
-          CHANGED_CODE=$(git diff --name-only "$BASE...$HEAD" | \
-            grep -Ev '(^|/)(node_modules|vendor|dist|build|out|coverage|\.git|\.husky|\.vscode|\.idea)($|/)' || true)
+          # Deleted files in this PR
+          git diff --name-status "$BASE...$HEAD" | awk '$1=="D"{print $2}' > deleted_files.txt || true
+
+          # Changed code diff for context
+          CHANGED=$(git diff --name-only "$BASE...$HEAD" || true)
+          CHANGED_CODE=$(echo "$CHANGED" | grep -F -f repo_code_files.txt || true)
           if [ -n "$CHANGED_CODE" ]; then
-            git --no-pager diff --unified=0 "$BASE...$HEAD" -- $CHANGED_CODE > pr_code_only.diff || true
+            git --no-pager diff --unified=0 "$BASE...$HEAD" -- $CHANGED_CODE > changed_code.diff || true
           else
-            : > pr_code_only.diff
+            : > changed_code.diff
           fi
 
-          # Quick signals for later conditions (not strictly required)
-          if [ -s pr_name_status.txt ]; then echo "has_pr_context=true" >> $GITHUB_OUTPUT; else echo "has_pr_context=false" >> $GITHUB_OUTPUT; fi
+          if [ -s repo_code_files.txt ]; then
+            echo "has_code=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_code=false" >> $GITHUB_OUTPUT
+          fi
 
-      # --- Prepare Codex task ---------------------------------------------------------------
-      - name: Prepare comprehensive review prompt (full repo + PR awareness)
+      - name: Prepare repo-wide review prompt
+        if: ${{ steps.inv.outputs.has_code == 'true' }}
         run: |
           cat > review_task.txt << 'PROMPT'
-          You are Codex running in CI for a GitHub Pull Request.
+          You are Codex running in CI on a GitHub Pull Request.
 
-          GOALS:
-          1) **PR-AWARE IMPACT**: From pr_name_status.txt, list deleted files and analyze likely breakages
-             (missing imports, routes, test fixtures, assets). Use deleted_usage_refs.txt as hints.
-             Call out concrete failure modes (e.g., TS/JS import errors, Angular DI/provider issues, 404s, test compile fails).
-             For each, show **how to fix** with small patch/code snippets.
-          2) **FULL REPOSITORY REVIEW**: Holistically review the repository codebase (see repo_code_index.txt).
-             Focus on correctness, logic, API contracts, edge cases, and style consistency.
-             Prioritize entry points and files changed in this PR (pr_code_only.diff).
-          3) **VULNERABILITIES & SECRETS**: Do static checks:
-             - Hard-coded secrets/keys/tokens
-             - Insecure patterns (eval/Function, insecure random, weak hashing, outdated crypto, SQL injection, command injection, path traversal)
-             - Dependency risks via manifests (package.json, requirements.txt, go.mod, Cargo.toml, pom.xml, etc.)
-             - CORS/misconfig, unsafe HTTP usage
-             For each, assess likelihood/impact and propose **fixes**.
-          4) **PERFORMANCE**: Identify performance issues:
-             - Hot paths, N+1 queries, unnecessary re-renders, large bundle risks, sync I/O, blocking code on main thread
-             - Inefficient algorithms or missing memoization/caching
-             Provide **actionable improvements**.
-          5) **OUTPUT FORMAT**: Write a single concise Markdown report to STDOUT with sections:
-             - PR Impact: Deleted Files & Likely Errors (with fixes)
-             - Critical Bugs / Must-Fix
-             - Security & Vulnerabilities (with fixes)
-             - Performance (with improvements)
-             - Code Quality & Style
-             - Quick Checklist (must-fix first)
-             Reference file paths and, when useful, small code blocks.
+          GOAL:
+          Review the ENTIRE repository source code (not just the diff) and produce a single Markdown report to STDOUT.
 
-          AVAILABLE CONTEXT FILES IN WORKSPACE:
-            - pr_name_status.txt          (git name-status lines for this PR)
-            - pr_code_only.diff           (unified=0 diff for PR)
-            - pr_deleted_files.txt        (one path per deleted file)
-            - deleted_usage_refs.txt      (grep hits for deleted basenames across repo)
-            - repo_code_index.txt         (full-repo code + manifest file list)
+          MUST INCLUDE (in this order):
+          1) Summary (key risks/themes).
+          2) Deleted Files & Potential Breakages
+             - Use "deleted_files.txt". For each deleted file, identify plausible compile/runtime errors or API breakages it can cause.
+             - Cite specific dependents (files/symbols) that likely break; show how to fix (restore, update imports, replace calls, etc.).
+          3) Vulnerabilities
+             - Injection, SSRF, XSS/CSRF, command exec, path traversal, deserialization, weak crypto, insecure HTTP, unsafe eval.
+             - For each: file + line(s), evidence, severity, and concrete fix.
+          4) Performance
+             - Hot paths, N+1 queries, O(n^2) loops on large inputs, blocking I/O on hot paths, needless allocations.
+             - Include file + lines and before/after code where useful.
+          5) Hardcoded Secrets
+             - Look for keys/tokens/passwords/private keys/conn strings.
+             - For each: file + lines, obfuscate values, and recommend proper secret management.
+          6) Code Duplication
+             - Identify duplicate/near-duplicate blocks/functions across files.
+             - Provide file pairs/regions and suggested refactor.
+          7) Changed Code (Context)
+             - Use "changed_code.diff" only for context.
 
-          INSTRUCTIONS:
-          - Read the above text files; open code files on demand as needed.
-          - Keep signal high; avoid restating diffs verbatim. Be specific and actionable.
-          - Include “how to fix” for every critical or likely issue you report.
+          INPUTS:
+          - repo_code_files.txt, deleted_files.txt, changed_code.diff
+          - You may open and read any repo file.
+
+          CONSTRAINTS:
+          - Be specific and actionable. Include file paths and line numbers when possible.
+          - Use small patch-style code blocks for fixes.
+          - Say "Likely" when uncertain, with reasoning.
+
+          OUTPUT:
+          - Print the final Markdown report to STDOUT only (no files).
           PROMPT
 
-      # --- Run Codex and post directly to PR (no files written) -----------------------------
-      - name: Run Codex review (full repo, PR-aware)
+      - name: Run Codex review (repo-wide, no file)
         id: codex_review
+        if: ${{ steps.inv.outputs.has_code == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
-          REVIEW="$(codex exec "Read pr_name_status.txt, pr_code_only.diff, pr_deleted_files.txt, deleted_usage_refs.txt, and repo_code_index.txt. Then follow review_task.txt. $(cat review_task.txt)")" || true
-          if [ -z "$REVIEW" ]; then
-            REVIEW=":warning: Codex ran but produced no review output. Check CI logs."
-          fi
-          # Truncate to avoid excessive size (optional)
-          MAX=120000
-          if [ ${#REVIEW} -gt $MAX ]; then
-            REVIEW="${REVIEW:0:$MAX}\n\n… _(truncated)_"
-          fi
-          {
-            echo 'body<<EOF'
-            echo "$REVIEW"
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
+          REVIEW="$(codex exec "Read repo_code_files.txt, deleted_files.txt, and changed_code.diff, then follow review_task.txt. $(cat review_task.txt)")" || true
+          [ -z "$REVIEW" ] && REVIEW=":warning: Codex ran but produced no review output. Check CI logs."
+          MAX=120000; [ ${#REVIEW} -gt $MAX ] && REVIEW="${REVIEW:0:$MAX}\n\n… _(truncated)_"
+          { echo 'body<<EOF'; echo "$REVIEW"; echo 'EOF'; } >> "$GITHUB_OUTPUT"
 
       - name: Post review comment to PR
+        if: ${{ steps.inv.outputs.has_code == 'true' }}
         uses: actions/github-script@v7
         env:
           REVIEW_BODY_JSON: ${{ toJson(steps.codex_review.outputs.body) }}
@@ -170,4 +157,117 @@ jobs:
               repo: context.repo.repo,
               issue_number: context.payload.pull_request.number,
               body
+            });
+
+      # === README Auto-Create/Update ===
+      - name: Prepare README task (create or update)
+        if: ${{ steps.inv.outputs.has_code == 'true' && !github.event.pull_request.head.repo.fork }}
+        shell: bash
+        run: |
+          # Detect an existing README file case-insensitively
+          READMECAND=$(ls -1 README.md Readme.md README.MD 2>/dev/null | head -n1 || true)
+          echo "readme_path=${READMECAND}" >> $GITHUB_OUTPUT
+          if [ -n "$READMECAND" ]; then
+            echo "has_readme=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_readme=false" >> $GITHUB_OUTPUT
+          fi
+
+          cat > readme_task.txt << 'PROMPT'
+          You are Codex. Create or update the repository README in Markdown.
+
+          INPUTS:
+          - repo_code_files.txt : list of code files in the repo
+          - changed_code.diff   : unified=0 diff for changed code (context)
+          - If a README exists, read it and preserve valuable content (badges, links, usage). Update sections to reflect current code.
+
+          REQUIREMENTS:
+          - If README exists: update it in-place (revise Overview, Features, Install/Setup, Usage/Examples, API/Modules summary, Configuration/Env, Testing, Security notes, Performance tips, Known Issues, Contributing).
+          - If README is missing: generate a complete README with those sections.
+          - Call out breaking changes due to deleted files (from deleted_files.txt) and how to fix integrations.
+          - Include code snippets that compile where possible.
+          - Do not include secrets. If you see hardcoded secrets, add a "Security" note referencing the file path and remediation.
+          - Keep it concise, project-appropriate, and consistent with the repo’s language/framework.
+
+          OUTPUT:
+          - Print the full README Markdown to STDOUT (no front-matter).
+          PROMPT
+
+      - name: Generate README content with Codex
+        id: gen_readme
+        if: ${{ steps.inv.outputs.has_code == 'true' && !github.event.pull_request.head.repo.fork }}
+        shell: bash
+        env:
+          README_PATH: ${{ steps.Prepare_README_task.outputs.readme_path }}
+        run: |
+          set -euo pipefail
+          # Read existing README content if present
+          EXISTING=""
+          if ls -1 README.md Readme.md README.MD >/dev/null 2>&1; then
+            RP=$(ls -1 README.md Readme.md README.MD | head -n1)
+            EXISTING="$(printf '\n\n--- EXISTING README START ---\n'; cat "$RP" | sed 's/`/`/g'; printf '\n--- EXISTING README END ---\n')"
+          fi
+
+          OUT="$(codex exec "Read repo_code_files.txt, deleted_files.txt, and changed_code.diff. $EXISTING Then follow readme_task.txt. $(cat readme_task.txt)")" || true
+          if [ -z "$OUT" ]; then
+            echo "body<<EOF" >> "$GITHUB_OUTPUT"
+            echo ":warning: Codex produced no README content; skipping update." >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          printf "%s\n" "$OUT" > README.new.md
+
+          # Determine target path (existing README path or default README.md)
+          TARGET=$(ls -1 README.md Readme.md README.MD 2>/dev/null | head -n1 || echo "README.md")
+
+          # Only replace if content differs
+          if [ ! -f "$TARGET" ] || ! diff -q "$TARGET" README.new.md >/dev/null 2>&1; then
+            mv -f README.new.md "$TARGET"
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+            echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          else
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            rm -f README.new.md || true
+          fi
+
+      - name: Commit & push README changes
+        if: ${{ steps.gen_readme.outputs.updated == 'true' && !github.event.pull_request.head.repo.fork }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${{ steps.gen_readme.outputs.target }}"
+          git commit -m "docs(readme): auto generate/update README via Codex"
+          git push
+
+      - name: Comment: README unchanged or skipped
+        if: ${{ (steps.inv.outputs.has_code == 'true') && (steps.gen_readme.outputs.updated != 'true' || github.event.pull_request.head.repo.fork) }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            let reason = "README unchanged (already up to date).";
+            if (context.payload.pull_request.head.repo.fork) {
+              reason = "Skipping README auto-commit for forked PR (insufficient permissions).";
+            } else if ("${{ steps.gen_readme.outputs.updated || '' }}" !== "true") {
+              reason = "README unchanged (no substantive updates needed).";
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: `ℹ️ ${reason}`
+            });
+
+      - name: Skip – no code files in repo
+        if: ${{ steps.inv.outputs.has_code != 'true' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: ":white_check_mark: No code files found to review (non-code repo or everything excluded)."
             });
