@@ -1,16 +1,75 @@
-# Angular Crash Course (TodoList)
+```markdown
+# Angular Crash Todo List
 
-This is the code for the crash course on YouTube
+This project is a simple Todo List application built with Angular. It allows users to create, read, update, and delete tasks seamlessly.
 
 ## Quick Start
 
-```bash
-# Install dependencies
-npm install
+To get started with this project, follow these steps:
 
-# Serve on localhost:4200
-ng serve
+1. **Install dependencies**:
+   ```bash
+   npm install
+   ```
+   
+2. **Run the application**:
+   ```bash
+   ng serve
+   ```
+   Open your browser to `http://localhost:4200`.
 
-# Build for production
-ng build
+3. **Run tests**:
+   ```bash
+   ng test
+   ```
+
+## Configuration & Environment Variables
+
+Create an `.env` file in the root directory and reference the following variables:
+
+```plaintext
+# Sample .env
+API_KEY=your_api_key_here
+DATABASE_URL=your_database_url_here
+```
+
+## Usage Examples / API
+
+- **Public Interfaces**:
+   - `TodoService`: Manages all Todo-related operations.
+   - `AppComponent`: Main component that interactive with users.
+    
+- **CLI Commands**:
+   - `ng generate component component-name`: Generate a new component.
+   
+- **Endpoints**:
+   - `/api/todos`: Fetch all todos.
+   - `/api/todos/:id`: Fetch a specific todo item.
+
+## Security Notes
+
+- Ensure all sensitive information is not hardcoded in the source code.
+- Use environment variables to manage secrets.
+
+## Performance Tips
+
+- Use caching strategies to improve load times.
+- Optimize bundle sizes with lazy loading of modules.
+- Consider using `ng build --prod` for production-ready builds.
+
+## Troubleshooting
+
+Common issues that may arise include:
+
+- **Missing `index.html`**: Ensure it's correctly linked in Angular routing or restore if deleted.
+- **TSLint Issues**: Validate your code style with `tslint.json` configuration.
+- Other issues from deleted files may result in errors; validate paths and imports.
+
+## Changelog
+
+**Changes in PR #1**: Updated the `main.ts` file to disable specific warnings, improving the production readiness of the application.
+
+## Contributing & License
+
+Contributions are welcome! Please follow the standard contribution guidelines. This project is licensed under the MIT License.
 ```
