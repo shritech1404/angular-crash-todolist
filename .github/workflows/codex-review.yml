@@ -8,6 +8,7 @@ permissions:
   contents: read
   pull-requests: write
 
+
 jobs:
   review:
     if: ${{ !github.event.pull_request.draft }}
@@ -182,4 +183,5 @@ jobs:
               issue_number: context.payload.pull_request.number,
               body: ":white_check_mark: No code files found to review (non-code repo or everything excluded)."
             });
+
 
