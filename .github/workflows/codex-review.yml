@@ -125,10 +125,16 @@ jobs:
           7) Changed Code (Context)
              - Use "changed_code.diff" only for additional context; do not limit the review to these changes.
 
+          8) Unnecessary Debug/Print Statements
+                 - If present, list every occurrence (file + line) and a short rationale.
+                 - Prefer removal, or guard behind environment-based log levels (e.g., DEBUG) or feature flags.
+                 - You may use "DEBUG_LOGS.tsv" (tab-separated: file, line, snippet) if present to populate this section; otherwise scan the repo.
+
           INPUTS AVAILABLE IN WORKSPACE:
           - repo_code_files.txt : newline list of all code files in the repo
           - deleted_files.txt   : newline list of files deleted in this PR
           - changed_code.diff   : unified=0 diff for changed code files (context only)
+          - DEBUG_LOGS.tsv      : optional TSV of debug/print findings (file, line, snippet)
           - You may open and read any repo files.
 
           CONSTRAINTS:
@@ -228,6 +234,8 @@ jobs:
           PATTERN='(console\.log|print\(|logger\.debug|debugger;|pdb\.set_trace|System\.out\.println|fmt\.Print(f|ln)?\(|printf\(|qDebug\()'
           # exclude tests and tooling
           MATCHES=$(grep -RInE "$PATTERN" -- $(cat repo_code_files.txt) 2>/dev/null | grep -Ev '(test|spec|\.snap|scripts/|tools/)' || true)
+
+          # Markdown summary (for README)
           {
             echo "### Debug/Verbose Logs"
             if [ -n "$MATCHES" ]; then
@@ -242,6 +250,14 @@ jobs:
               echo "_No stray debug prints found in non-test code._"
             fi
           } > ci_debug_logs.md
+
+          # TSV for Codex to consume in the review
+          if [ -n "$MATCHES" ]; then
+            echo -e "file\tline\tsnippet" > DEBUG_LOGS.tsv
+            echo "$MATCHES" | sed 's/:/ /' | awk '{file=$1; line=$2; $1=""; $2=""; sub(/^ /,""); printf("%s\t%s\t%s\n",file,line,substr($0,1,200))}' >> DEBUG_LOGS.tsv
+          else
+            : > DEBUG_LOGS.tsv
+          fi
 
       - name: Python dependency checks (requirements.txt)
         if: ${{ steps.inv.outputs.has_code == 'true' }}
@@ -403,4 +419,5 @@ jobs:
               issue_number: context.payload.pull_request.number,
               body: ":white_check_mark: No code files found to review (non-code repo or everything excluded)."
             });
+
 
