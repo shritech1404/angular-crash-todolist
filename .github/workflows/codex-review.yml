@@ -5,7 +5,7 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
-  contents: write         # was read; needed to push README updates
+  contents: read
   pull-requests: write
 
 jobs:
@@ -24,19 +24,8 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
 
-      - name: Set up Python (for pipreqs)
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-
       - name: Install Codex CLI
         run: npm i -g @openai/codex
-
-      - name: Install analysis tools (jscpd, pipreqs)
-        run: |
-          npm i -g jscpd@3
-          python -m pip install --upgrade pip
-          python -m pip install pipreqs
 
       - name: Configure Codex (Azure OpenAI)
         run: |
@@ -66,8 +55,10 @@ jobs:
         run: |
           set -euo pipefail
 
+          # All tracked files in repo
           git ls-files > all_files.txt
 
+          # Allow-list common code extensions; exclude docs/assets/vendor/build/etc.
           CODE=$(cat all_files.txt | \
             grep -E '\.(c|cc|cpp|cxx|h|hpp|hh|m|mm|cs|go|java|kt|kts|ts|tsx|js|jsx|py|rb|rs|php|swift|scala|lua|pl|erl|ex|exs|r|sql|sh|bash|ps1|dart|vue|svelte|cmake|mk|Makefile|gradle|groovy|zig)$' || true)
 
@@ -77,8 +68,10 @@ jobs:
 
           printf "%s\n" $CODE > repo_code_files.txt || true
 
+          # Deleted files between base and head (important for breakage analysis)
           git diff --name-status "$BASE...$HEAD" | awk '$1=="D"{print $2}' > deleted_files.txt || true
 
+          # Focused diff for changed code (context helps), but review will be repo-wide
           CHANGED=$(git diff --name-only "$BASE...$HEAD" || true)
           CHANGED_CODE=$(echo "$CHANGED" | grep -F -f repo_code_files.txt || true)
           if [ -n "$CHANGED_CODE" ]; then
@@ -87,6 +80,7 @@ jobs:
             : > changed_code.diff
           fi
 
+          # Flags for downstream steps
           if [ -s repo_code_files.txt ]; then
             echo "has_code=true" >> $GITHUB_OUTPUT
           else
@@ -151,6 +145,7 @@ jobs:
           if [ -z "$REVIEW" ]; then
             REVIEW=":warning: Codex ran but produced no review output. Check CI logs."
           fi
+          # Optional truncation to avoid comment size limits (adjust if needed)
           MAX=120000
           if [ ${#REVIEW} -gt $MAX ]; then
             REVIEW="${REVIEW:0:$MAX}\n\n… _(truncated)_"
@@ -176,243 +171,6 @@ jobs:
               body
             });
 
-      # ---------- NEW: Duplication check (jscpd) ----------
-      - name: Check code duplication with jscpd
-        if: ${{ steps.inv.outputs.has_code == 'true' }}
-        id: jscpd
-        run: |
-          set -euo pipefail
-          jscpd --silent --reporters json --output jscpd-report --pattern "**/*.{js,jsx,ts,tsx,py,rb,java,go,php,cs,cpp,c,h,swift,kt,scala,rs,sh,sql,vue,svelte}" || true
-          if [ -f jscpd-report/jscpd-report.json ]; then
-            node - <<'JS' > jscpd-summary.md
-            const fs = require('fs');
-            const r = JSON.parse(fs.readFileSync('jscpd-report/jscpd-report.json','utf8'));
-            if (!r.duplicates || !r.duplicates.length) { console.log("No significant duplications found."); process.exit(0); }
-            let out = `### Code Duplication Report (jscpd)\n\nFound ${r.duplicates.length} duplication groups.\n\n`;
-            for (const d of r.duplicates.slice(0, 50)) {
-              const a = d.firstFile, b = d.secondFile;
-              out += `- **${a.name}:${a.start.line}-${a.end.line}** ↔ **${b.name}:${b.start.line}-${b.end.line}** — **${d.lines} lines**\n`;
-            }
-            out += `\n> Consider extracting shared utilities or templates where applicable.\n`;
-            fs.writeFileSync('jscpd-summary.md', out);
-            JS
-          else
-            echo "No jscpd JSON report found." > jscpd-summary.md
-          fi
-        shell: bash
-
-      - name: Post duplication summary
-        if: ${{ steps.inv.outputs.has_code == 'true' }}
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('jscpd-summary.md', 'utf8');
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body
-            });
-
-      # ---------- NEW: Debug/log prints sweep ----------
-      - name: Scan for stray debug logs / prints
-        if: ${{ steps.inv.outputs.has_code == 'true' }}
-        run: |
-          set -euo pipefail
-          # ripgrep shipped on ubuntu-latest
-          rg -n --no-heading --color never -e '\bconsole\.log\(' \
-                                       -e '\bprint\(' \
-                                       -e '\bpdb\.set_trace\(' \
-                                       -e '\blogger\.debug\(' \
-                                       -e '\bSystem\.out\.println\(' \
-                                       -e '\bfmt\.Print(f|ln)?\(' \
-                                       -g '!**/node_modules/**' -g '!**/dist/**' -g '!**/build/**' \
-                                       || true > debug_hits.txt
-          if [ -s debug_hits.txt ]; then
-            {
-              echo "### Potential stray debug/log statements"
-              echo ""
-              echo "The following lines look like debug prints or verbose logs. Please confirm they are intentional or guard them with proper log levels/env checks."
-              echo ""
-              echo '```'
-              sed -n '1,400p' debug_hits.txt
-              [ $(wc -l < debug_hits.txt) -gt 400 ] && echo "... (truncated)"
-              echo '```'
-            } > debug-comment.md
-          else
-            echo "No obvious stray print/log statements found." > debug-comment.md
-          fi
-        shell: bash
-
-      - name: Post debug/log scan results
-        if: ${{ steps.inv.outputs.has_code == 'true' }}
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('debug-comment.md', 'utf8');
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body
-            });
-
-      # ---------- NEW: requirements.txt consistency check ----------
-      - name: Check Python requirements vs imports
-        if: ${{ steps.inv.outputs.has_code == 'true' }}
-        run: |
-          set -euo pipefail
-          if [ -f requirements.txt ]; then
-            pipreqs . --force --savepath generated_requirements.txt || true
-            echo "### requirements.txt consistency" > reqs-comment.md
-            if ! diff -u requirements.txt generated_requirements.txt > reqs.diff 2>/dev/null; then
-              echo "" >> reqs-comment.md
-              echo "Differences detected between **requirements.txt** and inferred imports:" >> reqs-comment.md
-              echo "" >> reqs-comment.md
-              echo '```diff' >> reqs-comment.md
-              sed -n '1,400p' reqs.diff >> reqs-comment.md
-              echo '```' >> reqs-comment.md
-              echo "" >> reqs-comment.md
-              echo "- If new libraries are imported, add them to requirements." >> reqs-comment.md
-              echo "- If unused entries exist, consider pruning to speed up installs and reduce attack surface." >> reqs-comment.md
-            else
-              echo "" >> reqs-comment.md
-              echo "No differences found; requirements look in sync with imports." >> reqs-comment.md
-            fi
-          else
-            echo "No requirements.txt found; skipping Python dependency check." > reqs-comment.md
-          fi
-        shell: bash
-
-      - name: Post requirements check
-        if: ${{ steps.inv.outputs.has_code == 'true' }}
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('reqs-comment.md', 'utf8');
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body
-            });
-
-      # ---------- NEW: Config / ENV handling review via Codex ----------
-      - name: Config & environment variable handling review
-        if: ${{ steps.inv.outputs.has_code == 'true' }}
-        id: codex_env_review
-        run: |
-          set -euo pipefail
-          cat > env_review_prompt.txt << 'P'
-          Scan the repository for configuration and environment variable usage:
-          - Identify places reading env/config (e.g., os.environ, dotenv, process.env, argparse/flags, YAML/TOML/JSON configs).
-          - For each, assess: defaulting, validation, secrets exposure, type coercion, and failure modes.
-          - Call out any missing defaults, unsafe fallbacks (empty string), or secrets printed to logs.
-          - Suggest concrete fixes with small patches (add schema/validators, centralize config loader, redact logs).
-          Output a concise Markdown report with file paths + line ranges.
-          P
-          OUT="$(codex exec "Read env_review_prompt.txt then read the repo and produce the requested report.")" || true
-          echo "${OUT:-':warning: No output from env handling review.'}" > env-review.md
-
-      - name: Post config/env review
-        if: ${{ steps.inv.outputs.has_code == 'true' }}
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('env-review.md', 'utf8');
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body
-            });
-
-      # ---------- NEW: Auto-update README.md ----------
-      - name: Draft README.md content with Codex
-        if: ${{ steps.inv.outputs.has_code == 'true' }}
-        id: codex_readme
-        run: |
-          set -euo pipefail
-          cat > readme_prompt.txt << 'PROMPT'
-          Generate a high-quality README.md for this repository based on the current codebase:
-          - Include: project overview, features, quickstart, prerequisites, installation, configuration (env vars), running locally, testing, linting, build/deploy, troubleshooting, security (secrets handling), and contribution guidelines.
-          - Auto-detect primary language, entry points, and CLIs/services.
-          - Use badges only if they clearly apply without external secrets.
-          - Keep it concise and actionable; include code blocks as needed.
-          Output raw Markdown only.
-          PROMPT
-          README_NEW="$(codex exec "Read readme_prompt.txt, scan the repo, and output README.md.")" || true
-          echo "${README_NEW:-''}" > README.generated.md
-
-      - name: Propose or push README update
-        if: ${{ steps.inv.outputs.has_code == 'true' }}
-        env:
-          IS_SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
-        run: |
-          set -euo pipefail
-          if [ ! -s README.generated.md ]; then
-            echo "README generation produced empty output; skipping."
-            exit 0
-          fi
-
-          # If no README exists, treat as new.
-          [ -f README.md ] || touch README.md
-
-          if diff -u README.md README.generated.md > README.patch; then
-            echo "README is already up to date; no changes."
-            exit 0
-          fi
-
-          if [ "${IS_SAME_REPO}" = "true" ]; then
-            # Commit directly to PR branch
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            mv README.generated.md README.md
-            git add README.md
-            git commit -m "docs: auto-update README.md via CI"
-            git push
-          else
-            # Post patch suggestion for forks
-            {
-              echo "### README update suggestion"
-              echo ""
-              echo "A generated README is proposed below as a unified diff:"
-              echo ""
-              echo '```diff'
-              sed -n '1,400p' README.patch
-              [ $(wc -l < README.patch) -gt 400 ] && echo "... (truncated)"
-              echo '```'
-              echo ""
-              echo "_Note: Cannot push to forked PR branches; apply manually if desired._"
-            } > readme-comment.md
-
-            node -e "
-              const fs = require('fs');
-              const body = fs.readFileSync('readme-comment.md','utf8');
-              const core = require('@actions/core');
-              core.setOutput('body', body);
-            " > /dev/null
-
-            echo "POST_COMMENT=1" >> $GITHUB_ENV
-          fi
-
-      - name: Comment README patch (forks)
-        if: env.POST_COMMENT == '1'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const body = process.env.BODY || require('fs').readFileSync('readme-comment.md','utf8');
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body
-            });
-
       - name: Skip – no code files in repo
         if: ${{ steps.inv.outputs.has_code != 'true' }}
         uses: actions/github-script@v7
@@ -424,3 +182,4 @@ jobs:
               issue_number: context.payload.pull_request.number,
               body: ":white_check_mark: No code files found to review (non-code repo or everything excluded)."
             });
+
