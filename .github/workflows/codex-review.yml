@@ -17,4 +17,5 @@ jobs:
         run: |
           npm install -g @openai/codex
           export AZURE_OPENAI_API_KEY="${{ secrets.AZURE_OPENAI_API_KEY }}"
-          codex -p azure -m gpt-5-mini exec --full-auto "update CHANGELOG for next release"
+          codex -p azure -m codex-mini exec --full-auto "update CHANGELOG for next release"
+
