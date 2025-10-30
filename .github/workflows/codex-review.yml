@@ -103,21 +103,14 @@ jobs:
           2) Deleted Files & Potential Breakages
              - Use "deleted_files.txt". For each deleted file, identify plausible compile/runtime errors or API breakages it can cause.
              - Cite specific dependents (files/symbols) that likely break; show how to fix (restore, update imports, replace calls, etc.).
-          3) Vulnerabilities
-             - Look for common security issues (injection, unsafe deserialization, path traversal, SSRF, XSS, CSRF, command injection, weak crypto, insecure HTTP).
-             - Call out risky dependencies or unpinned versions if visible.
-             - For each finding, include file path + line(s), evidence, severity, and concrete fix steps.
-          4) Performance
-             - Identify hot paths, N+1 queries, excessive allocations, unnecessary recomputation, O(n^2) loops on large inputs, blocking I/O on hot paths.
-             - Include file path + line(s) and show before/after code snippets or micro-optimizations.
-          5) Hardcoded Secrets
+          3) Hardcoded Secrets
              - Scan for access keys, tokens, passwords, private keys, connection strings.
              - For each suspected secret, list file path + line(s), obfuscate values (do NOT print full secrets), and recommend secret management approach.
              - Example patterns: AWS_(ACCESS|SECRET)|AKIA|xox[baprs]-|ghp_|ssh\-rsa|BEGIN [A-Z ]+PRIVATE KEY|password\s*=|token\s*=
-          6) Code Duplication
+          4) Code Duplication
              - Identify significant duplicate or near-duplicate functions/blocks across files (same/very similar logic).
              - Provide file pairs/regions, a brief rationale, and a suggested refactor (shared util, template, or abstraction).
-          7) Changed Code (Context)
+          5) Changed Code (Context)
              - Use "changed_code.diff" only for additional context; do not limit the review to these changes.
 
           INPUTS AVAILABLE IN WORKSPACE:
@@ -183,6 +176,7 @@ jobs:
               issue_number: context.payload.pull_request.number,
               body: ":white_check_mark: No code files found to review (non-code repo or everything excluded)."
             });
+
 
 
 
