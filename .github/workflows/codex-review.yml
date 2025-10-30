@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      CODEX_MODEL: codex-mini
+      CODEX_MODEL: gpt-5-mini
       AZURE_OPENAI_API_VERSION: preview
 
     steps:
@@ -183,5 +183,6 @@ jobs:
               issue_number: context.payload.pull_request.number,
               body: ":white_check_mark: No code files found to review (non-code repo or everything excluded)."
             });
+
 
 
