@@ -98,16 +98,7 @@ jobs:
           Review the ENTIRE repository source code (not just the diff) and produce a single Markdown report to STDOUT.
 
           MUST INCLUDE (in this order):
-          1) Summary
-             - One-paragraph overview of key risks and themes.
-          2) Deleted Files & Potential Breakages
-             - Use "deleted_files.txt". For each deleted file, identify plausible compile/runtime errors or API breakages it can cause.
-             - Cite specific dependents (files/symbols) that likely break; show how to fix (restore, update imports, replace calls, etc.).
-          3) Hardcoded Secrets
-             - Scan for access keys, tokens, passwords, private keys, connection strings.
-             - For each suspected secret, list file path + line(s), obfuscate values (do NOT print full secrets), and recommend secret management approach.
-             - Example patterns: AWS_(ACCESS|SECRET)|AKIA|xox[baprs]-|ghp_|ssh\-rsa|BEGIN [A-Z ]+PRIVATE KEY|password\s*=|token\s*=
-          4) Code Duplication
+          1) Code Duplication
              - Identify significant duplicate or near-duplicate functions/blocks across files (same/very similar logic).
              - Provide file pairs/regions, a brief rationale, and a suggested refactor (shared util, template, or abstraction).
           5) Changed Code (Context)
@@ -176,6 +167,7 @@ jobs:
               issue_number: context.payload.pull_request.number,
               body: ":white_check_mark: No code files found to review (non-code repo or everything excluded)."
             });
+
 
 
 
