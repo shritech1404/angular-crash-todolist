@@ -91,6 +91,7 @@ _No significant duplication detected (by jscpd thresholds)._
 | File | Line | Snippet |
 |------|------|---------|
 | src/app/components/todo-item/todo-item.component.ts | 34: | ` this.todoService.toggleCompleted(todo).subscribe(todo => console.log(todo));` |
+| src/main.ts | 10:print("angulatTodo") | `` |
 
 _Remove or guard with environment-based log levels before merging._
 
